@@ -1,0 +1,8 @@
+{
+  "name": "gmail-task-reminder",
+  "type": "md-agent",
+  "launch_cmd": "cat .agent-memory/agents/gmail-task-reminder.md",
+  "md_file": ".agent-memory/agents/gmail-task-reminder.md",
+  "created": "2026-04-06T02:23:28.117945",
+  "settings": {}
+}

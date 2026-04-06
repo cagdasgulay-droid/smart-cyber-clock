@@ -1,0 +1,8 @@
+{
+  "name": "ucak-bilet-maliyet",
+  "type": "md-agent",
+  "launch_cmd": "cat .agent-memory/agents/ucak-bilet-maliyet-tablosu.md",
+  "md_file": ".agent-memory/agents/ucak-bilet-maliyet-tablosu.md",
+  "created": "2026-04-06T02:23:28.173958",
+  "settings": {}
+}

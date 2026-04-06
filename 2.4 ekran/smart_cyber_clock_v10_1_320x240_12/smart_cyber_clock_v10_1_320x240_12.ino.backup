@@ -1,0 +1,3357 @@
+/*
+ * Smart Cyber Clock v10.1 (ST7789)
+ * ================================
+ * Changes from v5/v6:
+ *   - HA LED control simplified:
+ *     - Removed light entity (was causing mode conflicts)
+ *     - Added "Backlight Dimmer" number entity (0-255 slider)
+ *     - Slider only changes brightness, does NOT change LED mode
+ *     - LED mode select on HA removed (modes are device-only)
+ *     - ON/OFF, Breathe, Blink, SOS still work from device menu
+ *   - All other features unchanged
+ *
+ * Menu: Monitor, Pomodoro, Alarm, Snake, Tetris, Backlight, Ayarlar
+ */
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <Adafruit_AHTX0.h>
+#include <ScioSense_ENS160.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "time.h"
+
+// ====== WiFi Config ======
+const char* ssid     = "Asya";
+const char* password = "Asya2018";
+
+// ====== NTP Config (GMT+3 Türkiye) ======
+const char* ntpServer          = "pool.ntp.org";
+const long  gmtOffset_sec      = 3 * 3600;
+const int   daylightOffset_sec = 0;
+
+// ====== MQTT Config ======
+const char* mqtt_server    = "homeassistant.local";
+const int   mqtt_port      = 1883;
+const char* mqtt_user      = "cgdsgly";
+const char* mqtt_password  = "Asya_^2016";
+const char* mqtt_client_id = "cyberclock";
+
+// MQTT Topics
+#define TOPIC_PREFIX       "cyberclock"
+#define TOPIC_STATUS       TOPIC_PREFIX "/status"
+#define TOPIC_TEMP         TOPIC_PREFIX "/sensor/temperature"
+#define TOPIC_HUM          TOPIC_PREFIX "/sensor/humidity"
+#define TOPIC_TVOC         TOPIC_PREFIX "/sensor/tvoc"
+#define TOPIC_CO2          TOPIC_PREFIX "/sensor/co2"
+#define TOPIC_ALARM_SET    TOPIC_PREFIX "/alarm/set"
+#define TOPIC_ALARM_STATE  TOPIC_PREFIX "/alarm/state"
+#define TOPIC_BUZZER_SET   TOPIC_PREFIX "/buzzer/set"
+// LED ON/OFF (switch) + dimmer (number slider) + mode (select)
+#define TOPIC_BL_SET       TOPIC_PREFIX "/backlight/set"
+#define TOPIC_BL_STATE     TOPIC_PREFIX "/backlight/state"
+#define TOPIC_VOL_SET      TOPIC_PREFIX "/volume/set"
+#define TOPIC_VOL_STATE    TOPIC_PREFIX "/volume/state"
+#define TOPIC_TCAL_SET     TOPIC_PREFIX "/calibration/temp/set"
+#define TOPIC_TCAL_STATE   TOPIC_PREFIX "/calibration/temp/state"
+#define TOPIC_HCAL_SET     TOPIC_PREFIX "/calibration/hum/set"
+#define TOPIC_HCAL_STATE   TOPIC_PREFIX "/calibration/hum/state"
+#define TOPIC_SLEEP_SET    TOPIC_PREFIX "/sleep/set"
+#define TOPIC_SLEEP_STATE  TOPIC_PREFIX "/sleep/state"
+#define TOPIC_AUTOSLEEP_SET  TOPIC_PREFIX "/autosleep/set"
+#define TOPIC_AUTOSLEEP_STATE TOPIC_PREFIX "/autosleep/state"
+#define TOPIC_WEATHER      TOPIC_PREFIX "/weather"
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+unsigned long lastMqttPublish   = 0;
+unsigned long lastMqttReconnect = 0;
+const unsigned long MQTT_PUBLISH_INTERVAL   = 30000;
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+
+// ====== Pins ======
+#define TFT_CS    9
+#define TFT_DC    8
+#define TFT_RST   7
+#define TFT_MOSI  6
+#define TFT_SCLK  5
+#define ENC_A_PIN   10
+#define ENC_B_PIN   20
+#define ENC_BTN_PIN 21
+#define KEY0_PIN    0
+#define SDA_PIN 1
+#define SCL_PIN 2
+#define BL_PIN   4    // Backlight (was Backlight)
+#define BUZZ_PIN 3
+
+// ====== TFT & Sensors ======
+Adafruit_ST7789  tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_AHTX0   aht;
+ScioSense_ENS160 ens160(0x53);
+
+// ====== Colors ======
+#define CYBER_BG      ST77XX_BLACK
+#define CYBER_GREEN   0x07E0
+#define CYBER_ACCENT  0x07FF
+#define CYBER_LIGHT   0xFD20
+#define CYBER_PINK    0xF81F
+#define CLR_CLOCK     0xFFFF    // Beyaz - saat
+#define CLR_HUM       0x0E9F    // Turkuaz - nem
+#define CLR_TEMP      0xFCA0    // Amber/turuncu - sicaklik
+#define CLR_DATE      0xC37F    // Lavanta/acik mor - tarih
+#define CLR_WEATHER   0x47E0    // Yesil - hava durumu
+#define CLR_WDETAIL   0xAD55    // Acik gri - hava detay
+#define AQ_BAR_GREEN  0x07E0
+#define AQ_BAR_YELLOW 0xFFE0
+#define AQ_BAR_ORANGE 0xFD20
+#define AQ_BAR_RED    0xF800
+#define CYBER_DARK    0x4208
+#define CYBER_GREY    0x9CF3    // Light grey for labels (close to white)
+
+#ifndef PI
+#define PI 3.1415926
+#endif
+
+// ====== Volume ======
+uint8_t volumeLevel = 80;  // 0-100 percent
+
+// ====== Temperature Calibration ======
+float tempOffset = 0.0;  // -15.0 to +15.0 degrees
+float humOffset = 0.0;   // -20.0 to +20.0 percent
+
+// ====== Sleep timeout (declared early for saveSettings/loadSettings) ======
+unsigned long sleepTimeoutMs = 60000;    // Auto-sleep after 60s inactivity (0=disabled)
+
+// ====== Backlight (declared early for saveSettings/loadSettings) ======
+uint8_t backlightLevel = 200;  // 0-255 PWM
+
+// ====== Persistent Storage (NVS) ======
+Preferences prefs;
+
+// Forward declare for saveSettings/loadSettings
+#define ALARM_COUNT_EARLY 8
+uint8_t selectedAlarm = 0;
+
+void saveSettings() {
+  prefs.begin("cyberclock", false);  // read-write
+  prefs.putFloat("tempOff", tempOffset);
+  prefs.putFloat("humOff", humOffset);
+  prefs.putUChar("volume", volumeLevel);
+  prefs.putUChar("backlight", backlightLevel);
+  prefs.putULong("sleepMs", sleepTimeoutMs);
+  prefs.putUChar("alarmSnd", selectedAlarm);
+  prefs.end();
+}
+
+void loadSettings() {
+  prefs.begin("cyberclock", true);  // read-only
+  tempOffset = prefs.getFloat("tempOff", 0.0);
+  humOffset = prefs.getFloat("humOff", 0.0);
+  volumeLevel = prefs.getUChar("volume", 80);
+  backlightLevel = prefs.getUChar("backlight", 200);
+  sleepTimeoutMs = prefs.getULong("sleepMs", 60000);
+  selectedAlarm = prefs.getUChar("alarmSnd", 0);
+  prefs.end();
+  selectedAlarm = constrain(selectedAlarm, 0, ALARM_COUNT_EARLY-1);
+  // Clamp values
+  tempOffset = constrain(tempOffset, -15.0f, 15.0f);
+  humOffset = constrain(humOffset, -20.0f, 20.0f);
+  volumeLevel = constrain(volumeLevel, 0, 100);
+}
+
+// Helper: play tone with volume control via PWM duty cycle
+unsigned long vToneEndMs = 0;
+bool buzzAttached = false;
+
+void vTone(int pin, int freq, int durMs) {
+  if (volumeLevel == 0) return;
+  if (freq <= 0) { vToneStop(); return; }
+  int duty = map(volumeLevel, 0, 100, 0, 128);
+  // Stop previous tone briefly for note separation
+  if (buzzAttached) {
+    ledcWrite(pin, 0);
+    ledcDetach(pin);
+    delayMicroseconds(800);  // tiny gap between notes
+  }
+  ledcAttach(pin, freq, 8);
+  ledcWrite(pin, duty);
+  buzzAttached = true;
+  if (durMs > 0) vToneEndMs = millis() + durMs;
+}
+
+void vToneStop() {
+  if (buzzAttached) {
+    ledcWrite(BUZZ_PIN, 0);
+    ledcDetach(BUZZ_PIN);
+    buzzAttached = false;
+  }
+  vToneEndMs = 0;
+}
+
+void vToneUpdate() {
+  if (vToneEndMs > 0 && millis() >= vToneEndMs) {
+    vToneStop();
+  }
+}
+
+// ====== Modes ======
+enum UIMode { MODE_MENU=0, MODE_CLOCK, MODE_POMODORO, MODE_ALARM, MODE_GAMES_MENU, MODE_GAME, MODE_TETRIS, MODE_BREAKOUT, MODE_FLAPPY, MODE_PONG, MODE_2048, MODE_BRIGHT, MODE_HOME, MODE_SETTINGS, MODE_SLEEP };
+UIMode currentMode = MODE_CLOCK;
+UIMode preSleepMode = MODE_CLOCK;  // Remember mode before sleep
+int menuIndex = 0;
+const int MENU_ITEMS = 8;  // Monitor, Pomodoro, Alarm, Oyunlar, Backlight, Ev, Ayarlar, Uyku
+
+// ====== Games Sub-Menu ======
+int gamesMenuIndex = 0;
+const int GAMES_COUNT = 6;
+const char* gameNames[] = {"Snake", "Tetris", "Breakout", "Flappy Bird", "Pong", "2048"};
+
+// ====== Sleep Mode ======
+bool screenSleeping = false;
+bool screenDimmed = false;               // Screen is dimmed (pre-sleep)
+unsigned long dimStartMs = 0;            // When dimming started
+const unsigned long DIM_TO_SLEEP_MS = 120000;  // 2 min from dim to full sleep
+unsigned long lastActivityMs = 0;        // Last user interaction timestamp
+unsigned long k0HoldStart = 0;           // K0 long press detection
+bool k0Held = false;
+
+// ====== Backlight ======
+// (backlightLevel declared above for saveSettings/loadSettings)
+
+// ====== Melodies ======
+#define NOTE_C4 262
+#define NOTE_D4 294
+#define NOTE_E4 330
+#define NOTE_F4 349
+#define NOTE_G4 392
+#define NOTE_A4 440
+#define NOTE_Bb4 466
+#define NOTE_B4 494
+#define NOTE_C5 523
+#define NOTE_D5 587
+#define NOTE_E5 659
+#define NOTE_F5 698
+#define NOTE_G5 784
+#define NOTE_A5 880
+#define NOTE_REST 0
+
+// ====== RTTTL Parser & Player ======
+#define RTTTL_MAX_NOTES 64
+int rtttlNotes[RTTTL_MAX_NOTES];
+int rtttlDurs[RTTTL_MAX_NOTES];
+int rtttlLen = 0;
+
+// Note frequency table
+const int rtttlFreqs[] = {0, 262,277,294,311,330,349,370,392,415,440,466,494};
+//                         p  c   c#  d   d#  e   f   f#  g   g#  a   a#  b
+
+int rtttlNoteFreq(int note, int octave) {
+  if (note == 0) return 0; // pause
+  int f = rtttlFreqs[note];
+  int shift = octave - 4;
+  if (shift > 0) for(int i=0;i<shift;i++) f *= 2;
+  if (shift < 0) for(int i=0;i<-shift;i++) f /= 2;
+  return f;
+}
+
+int parseRTTTL(const char* rtttl) {
+  rtttlLen = 0;
+  const char* p = rtttl;
+  // Skip name
+  while(*p && *p != ':') p++;
+  if(*p == ':') p++;
+  // Parse defaults: d=duration, o=octave, b=bpm
+  int defDur = 4, defOct = 6, bpm = 63;
+  while(*p && *p != ':') {
+    while(*p == ' ' || *p == ',') p++;
+    if(*p == 'd' && *(p+1) == '=') { p+=2; defDur = atoi(p); while(*p >= '0' && *p <= '9') p++; }
+    else if(*p == 'o' && *(p+1) == '=') { p+=2; defOct = atoi(p); while(*p >= '0' && *p <= '9') p++; }
+    else if(*p == 'b' && *(p+1) == '=') { p+=2; bpm = atoi(p); while(*p >= '0' && *p <= '9') p++; }
+    else p++;
+  }
+  if(*p == ':') p++;
+  int wholeNote = (60000UL * 4) / bpm;
+
+  // Parse notes
+  while(*p && rtttlLen < RTTTL_MAX_NOTES) {
+    while(*p == ' ' || *p == ',') p++;
+    if(!*p) break;
+    // Duration
+    int dur = 0;
+    while(*p >= '0' && *p <= '9') { dur = dur*10 + (*p-'0'); p++; }
+    if(dur == 0) dur = defDur;
+    // Note
+    int note = 0;
+    switch(*p) {
+      case 'c': note=1; break; case 'd': note=3; break; case 'e': note=5; break;
+      case 'f': note=6; break; case 'g': note=8; break; case 'a': note=10; break;
+      case 'b': note=12; break; case 'p': note=0; break;
+    }
+    if(*p) p++;
+    if(*p == '#') { note++; p++; }
+    // Dotted
+    bool dotted = false;
+    // Octave
+    int oct = defOct;
+    if(*p >= '3' && *p <= '8') { oct = *p - '0'; p++; }
+    if(*p == '.') { dotted = true; p++; }
+
+    int ms = wholeNote / dur;
+    if(dotted) ms = ms * 3 / 2;
+
+    rtttlNotes[rtttlLen] = rtttlNoteFreq(note, oct);
+    rtttlDurs[rtttlLen] = ms;
+    rtttlLen++;
+  }
+  return rtttlLen;
+}
+
+// RTTTL alarm melodileri
+const char* rtttlAlarms[] = {
+  "Klasik:d=4,o=5,b=140:c,e,g,e,c,e,g,p",
+  "Sabah:d=4,o=5,b=100:e4,g4,a4,p,g4,a4,c,p,a4,c,e,p",
+  "Nokia:d=8,o=5,b=225:e6,d6,4f,4g,c#6,b,4d,4e,b,a,4c,4e,2a",
+  "Godfather:d=4,o=5,b=120:8g4,8c,8d#,8d,c,8a#4,8c,8g#4,2g4,8p,8g4,8c,8d#,8d,c,8g#4,8a4,8a#4,2c",
+  "StarWars:d=4,o=5,b=108:8d4,8d4,8d4,2g4,2d,8c,8b4,8a4,2g,d,8c,8b4,8a4,2g,d,8c,8b4,8c,2a4",
+  "MissionImp:d=16,o=6,b=150:d5,8p,d5,8p,d5,8p,d#5,p,e5,8p,d5,8p,d5,8p,d5,8p,d#5,p,e5,8p,d5,8p,d5,8p,e5,p,f5,8p,f5,p,e5,e5,d5",
+  "TakeOnMe:d=8,o=4,b=160:f#5,f#5,d5,b,p,b,p,e5,p,e5,p,e5,g#5,g#5,a5,b5,a5,a5,a5,e5,p,d5,p,f#5,p,f#5,p,f#5,e5,e5,f#5,e5",
+  "Macarena:d=8,o=5,b=180:f,f,f,4f,f,f,f,f,f,f,f,a,c,p,f,f,f,4f,f,f,f,f,f,f,d,c",
+};
+const char* rtttlNames[] = {"Klasik", "Sabah", "Nokia", "Baba", "StarWars", "Gorev", "TakeOnMe", "Macarena"};
+const int ALARM_COUNT = 8;
+
+// Parsed alarm cache
+int parsedAlarmIdx = -1;
+
+void playAlarmByIndex(int idx, bool loop) {
+  if(idx < 0 || idx >= ALARM_COUNT) idx = 0;
+  parseRTTTL(rtttlAlarms[idx]);
+  parsedAlarmIdx = idx;
+  startMelody(rtttlNotes, rtttlDurs, rtttlLen, loop);
+}
+
+// selectedAlarm declared earlier for saveSettings/loadSettings
+
+const int co2AlarmMelody[]    = {NOTE_A4, NOTE_REST, NOTE_A4, NOTE_REST, NOTE_A4, NOTE_REST, NOTE_E5, NOTE_REST};
+const int co2AlarmDurations[] = {200, 100, 200, 100, 200, 300, 400, 500};
+const int CO2_ALARM_MELODY_LEN = 8;
+const int pomoDoneMelody[]    = {NOTE_E4, NOTE_G4, NOTE_C5, NOTE_REST, NOTE_C5, NOTE_REST};
+const int pomoDoneDurations[] = {200, 200, 400, 100, 400, 200};
+const int POMO_MELODY_LEN = 6;
+const int notifMelody[]    = {NOTE_A4, NOTE_REST, NOTE_A4, NOTE_REST};
+const int notifDurations[] = {100, 50, 100, 50};
+const int NOTIF_MELODY_LEN = 4;
+
+bool melodyPlaying = false;
+const int* melodyNotes = NULL;
+const int* melodyDurs = NULL;
+int melodyLen = 0, melodyIdx = 0;
+unsigned long melodyLastMs = 0;
+bool melodyLoop = false;
+
+// ====== Pomodoro (free timer) ======
+enum PomodoroState { POMO_SELECT=0, POMO_RUNNING, POMO_PAUSED, POMO_DONE };
+PomodoroState pomoState = POMO_SELECT;
+uint8_t pomoMinutes = 5;
+uint8_t pomoSeconds = 0;
+int pomoField = 0;
+unsigned long pomoStartMillis = 0, pomoPausedMillis = 0;
+int prevPomoRemainSec = -1;
+bool prevPomoForce = true;
+
+// ====== Env values ======
+float curTemp = 0, curHum = 0;
+uint16_t curTVOC = 0, curECO2 = 400;
+unsigned long lastEnvRead = 0;
+int ensLastStatus = -1;  // ENS160 last measure status for on-screen debug
+
+// ====== Weather from HA ======
+// Format: {"temp":18.5,"hum":45,"cond":"Açık","wind":12.3}
+float weatherTemp = 0;
+int weatherHum = 0;
+float weatherWind = 0;
+char weatherCond[32] = "";
+bool weatherValid = false;
+
+// ====== Clock vars ======
+int prevSecond = -1;
+String prevTimeStr = "";
+
+// ====== Encoder & Buttons ======
+int lastEncA = HIGH, lastEncB = HIGH;
+bool lastEncBtn = HIGH, lastKey0 = HIGH;
+unsigned long lastBtnMs = 0;
+
+// ====== Alarm ======
+bool alarmEnabled = false;
+uint8_t alarmHour = 7, alarmMinute = 0;
+bool alarmRinging = false;
+int alarmSelectedField = 0, lastAlarmDayTriggered = -1;
+
+// ====== Alert ======
+enum AlertLevel { ALERT_NONE=0, ALERT_CO2, ALERT_ALARM };
+AlertLevel currentAlertLevel = ALERT_NONE;
+unsigned long lastCo2BlinkMs = 0;
+bool co2BlinkOn = false;
+bool alertLedActive = false;
+unsigned long lastAlertLedMs = 0;
+bool alertLedState = false;
+bool co2AlertTriggered = false;  // True when CO2 alarm is actively ringing
+
+// ====== Snake Game ======
+#define SNK_COLS 26
+#define SNK_ROWS 18
+#define SNK_BLOCK 12
+#define SNK_X 4
+#define SNK_Y 22
+int snakeX[320], snakeY[320];
+int snakeLen = 3;
+int snakeDir = 0;
+int snkDirQueue[4];       // Direction input queue (max 2 buffered turns)
+int snkDirQueueLen = 0;
+int foodX, foodY;
+int snkScore = 0;
+bool snkGameOver = false, snkInited = false;
+unsigned long snkLastMove = 0, snkMoveInterval = 200;
+
+// ====== Tetris ======
+// Forward declaration needed (Tetris K0 returns to games menu)
+void drawGamesMenu();
+// Tetris uses landscape mode (320x240) — grid left, info right
+// Layout: Left = grid (10*11=110px), Right = score/next/info (200px)
+#define TET_COLS 10
+#define TET_ROWS 20
+#define TET_BLOCK 11   // 10*11=110px wide, 20*11=220px tall
+#define TET_X 10       // Left margin
+#define TET_Y 10       // Top margin (20*11=220, fits 240)
+uint8_t tetBoard[TET_ROWS][TET_COLS];
+int tetPieceX, tetPieceY, tetPieceType, tetPieceRot;
+int tetNextPiece;
+unsigned long tetLastDrop = 0, tetDropInterval = 500;
+int tetScore = 0;
+bool tetGameOver = false, tetInited = false;
+unsigned long encBtnHoldStart = 0;
+bool encBtnHeld = false;
+
+const uint16_t tetPieces[7][4] = {
+  {0x0F00, 0x2222, 0x00F0, 0x4444},
+  {0x0E20, 0x44C0, 0x8E00, 0x6440},
+  {0x0E80, 0xC440, 0x2E00, 0x4460},
+  {0x0660, 0x0660, 0x0660, 0x0660},
+  {0x06C0, 0x4620, 0x06C0, 0x4620},
+  {0x0E40, 0x4C40, 0x4E00, 0x4640},
+  {0x0C60, 0x2640, 0x0C60, 0x2640},
+};
+const uint16_t tetColors[] = {CYBER_ACCENT, 0x001F, CYBER_LIGHT, AQ_BAR_YELLOW, CYBER_GREEN, CYBER_PINK, AQ_BAR_RED};
+
+bool tetGetBlock(int type, int rot, int r, int c) {
+  uint16_t mask = tetPieces[type][rot];
+  int bit = r * 4 + c;
+  return (mask >> (15 - bit)) & 1;
+}
+
+void tetDrawBlock(int col, int row, uint16_t color) {
+  if (row < 0 || row >= TET_ROWS || col < 0 || col >= TET_COLS) return;
+  int x = TET_X + col * TET_BLOCK;
+  int y = TET_Y + row * TET_BLOCK;
+  tft.fillRect(x, y, TET_BLOCK-1, TET_BLOCK-1, color ? color : CYBER_BG);
+}
+
+void tetDrawBoard() {
+  for (int r = 0; r < TET_ROWS; r++)
+    for (int c = 0; c < TET_COLS; c++)
+      tetDrawBlock(c, r, tetBoard[r][c] ? tetColors[tetBoard[r][c]-1] : 0);
+}
+
+void tetDrawPiece(int px, int py, int type, int rot, uint16_t color) {
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      if (tetGetBlock(type, rot, r, c)) {
+        int dr = py+r, dc = px+c;
+        if (dr >= 0 && dr < TET_ROWS && dc >= 0 && dc < TET_COLS) {
+          if (color == 0 && tetBoard[dr][dc] == 0)
+            tetDrawBlock(dc, dr, 0);
+          else if (color != 0)
+            tetDrawBlock(dc, dr, color);
+        }
+      }
+}
+
+bool tetCollision(int px, int py, int type, int rot) {
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      if (tetGetBlock(type, rot, r, c)) {
+        int nr = py + r, nc = px + c;
+        if (nc < 0 || nc >= TET_COLS || nr >= TET_ROWS) return true;
+        if (nr >= 0 && tetBoard[nr][nc]) return true;
+      }
+  return false;
+}
+
+void tetLockPiece() {
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      if (tetGetBlock(tetPieceType, tetPieceRot, r, c)) {
+        int nr = tetPieceY + r, nc = tetPieceX + c;
+        if (nr >= 0 && nr < TET_ROWS && nc >= 0 && nc < TET_COLS)
+          tetBoard[nr][nc] = tetPieceType + 1;
+      }
+}
+
+int tetClearLines() {
+  int cleared = 0;
+  for (int r = TET_ROWS - 1; r >= 0; r--) {
+    bool full = true;
+    for (int c = 0; c < TET_COLS; c++) if (!tetBoard[r][c]) { full = false; break; }
+    if (full) {
+      cleared++;
+      for (int rr = r; rr > 0; rr--)
+        for (int c = 0; c < TET_COLS; c++) tetBoard[rr][c] = tetBoard[rr-1][c];
+      for (int c = 0; c < TET_COLS; c++) tetBoard[0][c] = 0;
+      r++;
+    }
+  }
+  return cleared;
+}
+
+void tetSpawnPiece() {
+  tetPieceType = tetNextPiece;
+  tetNextPiece = random(7);
+  tetPieceX = 3;
+  tetPieceY = -1;
+  tetPieceRot = 0;
+  if (tetCollision(tetPieceX, tetPieceY, tetPieceType, tetPieceRot)) {
+    tetGameOver = true;
+  }
+}
+
+void tetDrawScore() {
+  int px = TET_X + TET_COLS*TET_BLOCK + 4;
+  tft.fillRect(px, 38, 100, 30, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(px, 38); tft.print("Skor");
+  tft.setTextSize(2); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(px, 50); tft.printf("%d", tetScore);
+}
+
+void tetDrawNext() {
+  int px = TET_X + TET_COLS*TET_BLOCK + 4;
+  int oy = 80;
+  // Clear entire next piece area (prevent overlapping from previous piece)
+  tft.fillRect(px, oy, 80, 70, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(px, oy); tft.print("Siradaki:");
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      if (tetGetBlock(tetNextPiece, 0, r, c))
+        tft.fillRect(px + c*14, oy + 14 + r*14, 13, 13, tetColors[tetNextPiece]);
+}
+
+void initTetris() {
+  tetInited = true;
+  tetGameOver = false;
+  tetScore = 0;
+  tetDropInterval = 500;
+  encBtnHoldStart = 0;
+  encBtnHeld = false;
+  memset(tetBoard, 0, sizeof(tetBoard));
+  tetNextPiece = random(7);
+  tetSpawnPiece();
+
+  // Stay in landscape mode (320x240)
+  tft.setRotation(3);
+  
+  tft.fillScreen(CYBER_BG);
+  
+  // Left: game grid border (full height)
+  tft.drawRect(TET_X-1, TET_Y, TET_COLS*TET_BLOCK+2, TET_ROWS*TET_BLOCK, ST77XX_WHITE);
+  
+  // Right panel (x=83 to 127, ~45px wide)
+  int px = TET_X + TET_COLS*TET_BLOCK + 4;  // 85
+  
+  // Title
+  tft.setTextSize(2); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(px, 10); tft.print("TETRIS");
+  
+  // Divider line
+  tft.drawFastHLine(px, 32, 80, CYBER_DARK);
+  
+  // Controls help (bottom of right panel)
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(px, 170); tft.print("Enc: L/R");
+  tft.setCursor(px, 185); tft.print("Bas: Don");
+  tft.setCursor(px, 200); tft.print("Uzun: Dusur");
+  tft.setCursor(px, 215); tft.print("K0: cik");
+
+  tetDrawScore();
+  tetDrawNext();
+  tetDrawBoard();
+}
+
+void updateTetris(int enc, bool encP, bool back) {
+  if (back) { tetInited=false; currentMode=MODE_GAMES_MENU; drawGamesMenu(); return; }
+
+  if (tetGameOver) {
+    int px = TET_X + TET_COLS*TET_BLOCK + 4;
+    tft.fillRect(px, 38, 190, 120, CYBER_BG);
+    tft.setTextSize(3); tft.setTextColor(ST77XX_RED, CYBER_BG);
+    tft.setCursor(px, 40); tft.print("GAME");
+    tft.setCursor(px, 70); tft.print("OVER!");
+    tft.setTextSize(2); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+    tft.setCursor(px, 110); tft.printf("Skor: %d", tetScore);
+    tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+    tft.setCursor(px, 140); tft.print("Bas: yeni oyun");
+    if (encP || enc != 0) { initTetris(); }
+    return;
+  }
+
+  bool encBtnCur = digitalRead(ENC_BTN_PIN);
+  if (encBtnCur == LOW) {
+    if (encBtnHoldStart == 0) encBtnHoldStart = millis();
+    if (!encBtnHeld && millis() - encBtnHoldStart > 300) {
+      encBtnHeld = true;
+      tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, 0);
+      while (!tetCollision(tetPieceX, tetPieceY + 1, tetPieceType, tetPieceRot)) {
+        tetPieceY++;
+      }
+      tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, tetColors[tetPieceType]);
+      tetLockPiece();
+      int lines = tetClearLines();
+      if (lines > 0) {
+        int pts[] = {0, 100, 300, 500, 800};
+        tetScore += pts[lines];
+        vTone(BUZZ_PIN, 1000 + lines * 200, 100);
+        if (tetDropInterval > 150) tetDropInterval -= 20;
+        tetDrawBoard(); tetDrawScore();
+      }
+      tetSpawnPiece(); tetDrawNext();
+      tetLastDrop = millis();
+      vTone(BUZZ_PIN, 400, 30);
+    }
+  } else {
+    if (encBtnHoldStart > 0 && !encBtnHeld) {
+      tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, 0);
+      int newRot = (tetPieceRot + 1) % 4;
+      if (!tetCollision(tetPieceX, tetPieceY, tetPieceType, newRot)) {
+        tetPieceRot = newRot;
+      }
+      tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, tetColors[tetPieceType]);
+    }
+    encBtnHoldStart = 0;
+    encBtnHeld = false;
+  }
+
+  if (enc != 0) {
+    tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, 0);
+    int newX = tetPieceX + enc;
+    if (!tetCollision(newX, tetPieceY, tetPieceType, tetPieceRot)) {
+      tetPieceX = newX;
+    }
+    tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, tetColors[tetPieceType]);
+  }
+
+  unsigned long now = millis();
+  if (now - tetLastDrop > tetDropInterval) {
+    tetLastDrop = now;
+    tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, 0);
+
+    if (!tetCollision(tetPieceX, tetPieceY + 1, tetPieceType, tetPieceRot)) {
+      tetPieceY++;
+    } else {
+      tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, tetColors[tetPieceType]);
+      tetLockPiece();
+      int lines = tetClearLines();
+      if (lines > 0) {
+        int pts[] = {0, 100, 300, 500, 800};
+        tetScore += pts[lines];
+        vTone(BUZZ_PIN, 1000 + lines * 200, 100);
+        if (tetDropInterval > 150) tetDropInterval -= 20;
+        tetDrawBoard();
+        tetDrawScore();
+      }
+      tetSpawnPiece();
+      tetDrawNext();
+    }
+    tetDrawPiece(tetPieceX, tetPieceY, tetPieceType, tetPieceRot, tetColors[tetPieceType]);
+  }
+}
+
+// ============================================================
+// BREAKOUT (Tuğla Kırma) — Landscape mode (160x128)
+// ============================================================
+// Layout: Left 130px = game area, Right 30px = score/lives panel
+#define BRK_AREA_W 260   // Game area width
+#define BRK_AREA_H 240   // Full height
+#define BRK_AREA_X 0
+#define BRK_PANEL_X 264  // Right panel start
+#define BRK_COLS 13
+#define BRK_ROWS 5
+#define BRK_BRICK_W 20   // 13*20=260
+#define BRK_BRICK_H 10
+#define BRK_BRICK_Y 4    // Bricks start Y
+#define BRK_PAD_W 52
+#define BRK_PAD_H 6
+#define BRK_PAD_Y 228    // Paddle near bottom
+
+uint8_t brkBricks[BRK_ROWS][BRK_COLS];  // 0=empty, 1-6=color tier
+float brkBallX, brkBallY, brkBallDX, brkBallDY;
+int brkPadX;  // Paddle center X (in game area coords)
+int brkScore = 0;
+int brkLives = 3;
+int brkBricksLeft = 0;
+bool brkGameOver = false, brkInited = false, brkBallActive = false;
+unsigned long brkLastFrame = 0;
+const unsigned long BRK_FRAME_MS = 20;  // ~50fps
+
+const uint16_t brkRowColors[] = {AQ_BAR_RED, AQ_BAR_ORANGE, AQ_BAR_YELLOW, CYBER_GREEN, CYBER_ACCENT};
+
+void brkDrawBrick(int col, int row, uint16_t color) {
+  int x = BRK_AREA_X + col * BRK_BRICK_W;
+  int y = BRK_BRICK_Y + row * BRK_BRICK_H;
+  if (color) {
+    tft.fillRect(x+1, y+1, BRK_BRICK_W-2, BRK_BRICK_H-2, color);
+  } else {
+    tft.fillRect(x, y, BRK_BRICK_W, BRK_BRICK_H, CYBER_BG);
+  }
+}
+
+void brkDrawPaddle(uint16_t color) {
+  int px = BRK_AREA_X + brkPadX - BRK_PAD_W/2;
+  tft.fillRect(BRK_AREA_X, BRK_PAD_Y, BRK_AREA_W, BRK_PAD_H, CYBER_BG);
+  tft.fillRect(px, BRK_PAD_Y, BRK_PAD_W, BRK_PAD_H, color);
+}
+
+void brkDrawBall(uint16_t color) {
+  tft.fillRect((int)brkBallX, (int)brkBallY, 5, 5, color);
+}
+
+void brkDrawScore() {
+  tft.fillRect(BRK_PANEL_X, 20, 28, 22, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(BRK_PANEL_X, 20); tft.print("Skr");
+  tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(BRK_PANEL_X, 32); tft.printf("%d", brkScore);
+}
+
+void brkDrawLives() {
+  tft.fillRect(BRK_PANEL_X, 50, 28, 22, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(BRK_PANEL_X, 50); tft.print("Can");
+  tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(BRK_PANEL_X, 62);
+  for(int i=0; i<brkLives; i++) tft.print("*");
+}
+
+void brkResetBall() {
+  brkBallActive = false;
+  brkBallX = BRK_AREA_X + brkPadX;
+  brkBallY = BRK_PAD_Y - 5;
+  brkBallDX = 2.0;
+  brkBallDY = -2.5;
+}
+
+void initBreakout() {
+  brkInited = true;
+  brkGameOver = false;
+  brkScore = 0;
+  brkLives = 3;
+  brkBricksLeft = BRK_ROWS * BRK_COLS;
+  brkPadX = BRK_AREA_W / 2;
+  
+  // Fill bricks
+  for (int r = 0; r < BRK_ROWS; r++)
+    for (int c = 0; c < BRK_COLS; c++)
+      brkBricks[r][c] = r + 1;
+
+  brkResetBall();
+
+  // Landscape mode (same as normal)
+  tft.setRotation(3);
+  tft.fillScreen(CYBER_BG);
+  
+  // Game area border (left side)
+  tft.drawFastVLine(BRK_AREA_W, 0, BRK_AREA_H, ST77XX_WHITE);
+  
+  // Right panel title
+  tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(BRK_PANEL_X, 4); tft.print("BRK");
+  tft.drawFastHLine(BRK_PANEL_X, 15, 26, CYBER_DARK);
+  
+  // Draw all bricks
+  for (int r = 0; r < BRK_ROWS; r++)
+    for (int c = 0; c < BRK_COLS; c++)
+      brkDrawBrick(c, r, brkRowColors[r]);
+  
+  brkDrawPaddle(ST77XX_WHITE);
+  brkDrawScore();
+  brkDrawLives();
+  brkDrawBall(ST77XX_WHITE);
+}
+
+void updateBreakout(int enc, bool encP, bool back) {
+  if (back) { brkInited=false; currentMode=MODE_GAMES_MENU; drawGamesMenu(); return; }
+  
+  if (brkGameOver) {
+    tft.setTextSize(2); tft.setTextColor(ST77XX_RED, CYBER_BG);
+    tft.setCursor(10, 45); tft.print("GAME OVER");
+    tft.setTextSize(1); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+    tft.setCursor(25, 70); tft.printf("Skor: %d", brkScore);
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(15, 90); tft.print("Bas: yeni oyun");
+    if (encP || enc != 0) initBreakout();
+    return;
+  }
+  
+  // Win check
+  if (brkBricksLeft <= 0) {
+    tft.setTextSize(2); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+    tft.setCursor(5, 45); tft.print("KAZANDIN!");
+    tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+    tft.setCursor(25, 70); tft.printf("Skor: %d", brkScore);
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(15, 90); tft.print("Bas: yeni oyun");
+    if (encP || enc != 0) initBreakout();
+    return;
+  }
+  
+  // Move paddle with encoder
+  if (enc != 0) {
+    brkDrawPaddle(CYBER_BG);  // Erase old
+    brkPadX = constrain(brkPadX + enc * 8, BRK_PAD_W/2, BRK_AREA_W - BRK_PAD_W/2);
+    brkDrawPaddle(ST77XX_WHITE);
+    if (!brkBallActive) {
+      // Ball follows paddle before launch
+      brkDrawBall(CYBER_BG);
+      brkBallX = BRK_AREA_X + brkPadX - 1;
+      brkBallY = BRK_PAD_Y - 5;
+      brkDrawBall(ST77XX_WHITE);
+    }
+  }
+  
+  // Launch ball
+  if (encP && !brkBallActive) {
+    brkBallActive = true;
+    brkBallDX = (random(2) == 0) ? 1.2 : -1.2;
+    brkBallDY = -2.5;
+    vTone(BUZZ_PIN, 800, 30);
+  }
+  
+  if (!brkBallActive) return;
+  
+  // Frame timing
+  unsigned long now = millis();
+  if (now - brkLastFrame < BRK_FRAME_MS) return;
+  brkLastFrame = now;
+  
+  // Erase ball
+  brkDrawBall(CYBER_BG);
+  
+  // Move ball
+  float newX = brkBallX + brkBallDX;
+  float newY = brkBallY + brkBallDY;
+  
+  // Wall bounce (left/right)
+  if (newX <= BRK_AREA_X || newX >= BRK_AREA_X + BRK_AREA_W - 3) {
+    brkBallDX = -brkBallDX;
+    newX = brkBallX + brkBallDX;
+    vTone(BUZZ_PIN, 400, 15);
+  }
+  
+  // Top bounce
+  if (newY <= 0) {
+    brkBallDY = -brkBallDY;
+    newY = brkBallY + brkBallDY;
+    vTone(BUZZ_PIN, 400, 15);
+  }
+  
+  // Paddle collision
+  if (newY >= BRK_PAD_Y - 3 && newY <= BRK_PAD_Y && brkBallDY > 0) {
+    int padLeft = BRK_AREA_X + brkPadX - BRK_PAD_W/2;
+    int padRight = padLeft + BRK_PAD_W;
+    if (newX + 5 >= padLeft && newX <= padRight) {
+      brkBallDY = -brkBallDY;
+      // Angle based on where ball hits paddle
+      float hitPos = (newX - padLeft) / (float)BRK_PAD_W;  // 0..1
+      brkBallDX = (hitPos - 0.5f) * 5.0f;  // -1.5 to +1.5
+      if (brkBallDX > -0.8f && brkBallDX < 0.8f) brkBallDX = (brkBallDX < 0) ? -0.8f : 0.8f;
+      newY = BRK_PAD_Y - 4;
+      vTone(BUZZ_PIN, 600, 30);
+    }
+  }
+  
+  // Miss — ball goes below paddle
+  if (newY > BRK_AREA_H - 4) {
+    brkLives--;
+    brkDrawLives();
+    if (brkLives <= 0) {
+      brkGameOver = true;
+      vTone(BUZZ_PIN, 200, 500);
+      return;
+    }
+    vTone(BUZZ_PIN, 300, 200);
+    brkResetBall();
+    brkDrawBall(ST77XX_WHITE);
+    return;
+  }
+  
+  // Brick collision
+  int bCol = ((int)newX - BRK_AREA_X) / BRK_BRICK_W;
+  int bRow = ((int)newY - BRK_BRICK_Y) / BRK_BRICK_H;
+  if (bRow >= 0 && bRow < BRK_ROWS && bCol >= 0 && bCol < BRK_COLS && brkBricks[bRow][bCol] > 0) {
+    brkBricks[bRow][bCol] = 0;
+    brkBricksLeft--;
+    brkScore += (BRK_ROWS - bRow) * 10;  // Top rows = more points
+    brkBallDY = -brkBallDY;
+    brkDrawBrick(bCol, bRow, 0);
+    brkDrawScore();
+    vTone(BUZZ_PIN, 1000 + bRow * 100, 30);
+    // Slight speed up
+    if (brkBallDY > 0) brkBallDY += 0.02; else brkBallDY -= 0.02;
+  }
+  
+  brkBallX = newX;
+  brkBallY = newY;
+  brkDrawBall(ST77XX_WHITE);
+}
+
+// ============================================================
+// FLAPPY BIRD — Landscape mode (160x128)
+// ============================================================
+// Layout: Left 130px = game, Right 30px = score panel
+#define FLP_AREA_W 260
+#define FLP_AREA_H 240
+#define FLP_PANEL_X 264
+#define FLP_BIRD_X 50      // Bird fixed X position
+#define FLP_BIRD_SIZE 12
+#define FLP_PIPE_W 24
+#define FLP_GAP 64         // Gap between top and bottom pipes
+#define FLP_PIPE_SPEED 3
+#define FLP_GRAVITY 0.35f
+#define FLP_FLAP_FORCE -3.5f
+#define FLP_MAX_PIPES 3
+
+struct FlpPipe {
+  int x;
+  int gapY;   // Center of gap
+  bool scored; // Already scored?
+  bool active;
+};
+
+FlpPipe flpPipes[FLP_MAX_PIPES];
+float flpBirdY, flpBirdVY;
+int flpScore = 0;
+int flpBestScore = 0;
+bool flpGameOver = false, flpInited = false, flpStarted = false;
+unsigned long flpLastFrame = 0;
+const unsigned long FLP_FRAME_MS = 25;  // ~40fps
+int flpPipeSpawnTimer = 0;
+
+void flpDrawBird(uint16_t color) {
+  int by = (int)flpBirdY;
+  // Bird body
+  tft.fillRect(FLP_BIRD_X, by, FLP_BIRD_SIZE, FLP_BIRD_SIZE, color);
+  if (color != CYBER_BG) {
+    // Eye
+    tft.fillRect(FLP_BIRD_X + 8, by + 2, 2, 2, CYBER_BG);
+    // Beak
+    tft.fillRect(FLP_BIRD_X + FLP_BIRD_SIZE, by + 4, 5, 4, AQ_BAR_ORANGE);
+  } else {
+    tft.fillRect(FLP_BIRD_X + FLP_BIRD_SIZE, by + 4, 5, 4, CYBER_BG);
+  }
+}
+
+void flpDrawPipe(int idx, uint16_t color) {
+  if (!flpPipes[idx].active || flpPipes[idx].x < -FLP_PIPE_W || flpPipes[idx].x > FLP_AREA_W) return;
+  int drawX = max(0, flpPipes[idx].x);
+  int drawW = min(FLP_PIPE_W, FLP_AREA_W - drawX);
+  if (flpPipes[idx].x < 0) drawW = FLP_PIPE_W + flpPipes[idx].x;
+  if (drawW <= 0) return;
+  // Top pipe
+  int topH = flpPipes[idx].gapY - FLP_GAP/2;
+  if (topH > 0) tft.fillRect(drawX, 0, drawW, topH, color == CYBER_BG ? CYBER_BG : CYBER_GREEN);
+  // Bottom pipe
+  int botY = flpPipes[idx].gapY + FLP_GAP/2;
+  int botH = FLP_AREA_H - botY;
+  if (botH > 0) tft.fillRect(drawX, botY, drawW, botH, color == CYBER_BG ? CYBER_BG : CYBER_GREEN);
+}
+
+void flpDrawScore() {
+  tft.fillRect(FLP_PANEL_X, 20, 28, 22, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(FLP_PANEL_X, 20); tft.print("Skr");
+  tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(FLP_PANEL_X, 32); tft.printf("%d", flpScore);
+}
+
+void flpDrawBest() {
+  tft.fillRect(FLP_PANEL_X, 50, 28, 22, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(FLP_PANEL_X, 50); tft.print("En");
+  tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(FLP_PANEL_X, 62); tft.printf("%d", flpBestScore);
+}
+
+void flpSpawnPipe(int idx) {
+  flpPipes[idx].x = FLP_AREA_W;
+  flpPipes[idx].gapY = random(FLP_GAP/2 + 16, FLP_AREA_H - FLP_GAP/2 - 16);
+  flpPipes[idx].scored = false;
+  flpPipes[idx].active = true;
+}
+
+void initFlappy() {
+  flpInited = true;
+  flpGameOver = false;
+  flpStarted = false;
+  flpScore = 0;
+  flpBirdY = FLP_AREA_H / 2 - FLP_BIRD_SIZE / 2;
+  flpBirdVY = 0;
+  flpPipeSpawnTimer = 0;
+  
+  for (int i = 0; i < FLP_MAX_PIPES; i++) flpPipes[i].active = false;
+  
+  tft.setRotation(3);
+  tft.fillScreen(CYBER_BG);
+  
+  // Game area border
+  tft.drawFastVLine(FLP_AREA_W, 0, FLP_AREA_H, ST77XX_WHITE);
+  
+  // Right panel
+  tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(FLP_PANEL_X, 4); tft.print("FLP");
+  tft.drawFastHLine(FLP_PANEL_X, 15, 26, CYBER_DARK);
+  
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(FLP_PANEL_X, 85); tft.print("Bas");
+  tft.setCursor(FLP_PANEL_X, 95); tft.print(" zip");
+  tft.setCursor(FLP_PANEL_X, 110); tft.print("K0");
+  tft.setCursor(FLP_PANEL_X, 120); tft.print(" cik");
+  
+  flpDrawScore();
+  flpDrawBest();
+  flpDrawBird(AQ_BAR_YELLOW);
+  
+  // Start prompt
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, CYBER_BG);
+  tft.setCursor(20, 60); tft.print("Bas: Baslat");
+}
+
+void updateFlappy(int enc, bool encP, bool back) {
+  if (back) { flpInited=false; currentMode=MODE_GAMES_MENU; drawGamesMenu(); return; }
+  
+  if (flpGameOver) {
+    tft.setTextSize(2); tft.setTextColor(ST77XX_RED, CYBER_BG);
+    tft.setCursor(15, 35); tft.print("BITTI!");
+    tft.setTextSize(1); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+    tft.setCursor(20, 60); tft.printf("Skor: %d", flpScore);
+    if (flpScore > flpBestScore) {
+      flpBestScore = flpScore;
+      tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+      tft.setCursor(15, 75); tft.print("Yeni rekor!");
+    }
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(10, 95); tft.print("Bas: tekrar");
+    if (encP) initFlappy();
+    return;
+  }
+  
+  // Start game on first press
+  if (!flpStarted) {
+    if (encP) {
+      flpStarted = true;
+      // Clear start text
+      tft.fillRect(0, 55, FLP_AREA_W, 15, CYBER_BG);
+      flpBirdVY = FLP_FLAP_FORCE;
+      vTone(BUZZ_PIN, 800, 30);
+    }
+    return;
+  }
+  
+  // Flap
+  if (encP) {
+    flpBirdVY = FLP_FLAP_FORCE;
+    vTone(BUZZ_PIN, 800, 20);
+  }
+  
+  // Frame timing
+  unsigned long now = millis();
+  if (now - flpLastFrame < FLP_FRAME_MS) return;
+  flpLastFrame = now;
+  
+  // Erase bird
+  flpDrawBird(CYBER_BG);
+  
+  // Physics
+  flpBirdVY += FLP_GRAVITY;
+  flpBirdY += flpBirdVY;
+  
+  // Floor/ceiling
+  if (flpBirdY < 0) { flpBirdY = 0; flpBirdVY = 0; }
+  if (flpBirdY > FLP_AREA_H - FLP_BIRD_SIZE) {
+    flpGameOver = true;
+    vTone(BUZZ_PIN, 200, 300);
+    return;
+  }
+  
+  // Spawn pipes
+  flpPipeSpawnTimer++;
+  if (flpPipeSpawnTimer >= 28) {  // Every ~700ms
+    flpPipeSpawnTimer = 0;
+    for (int i = 0; i < FLP_MAX_PIPES; i++) {
+      if (!flpPipes[i].active) { flpSpawnPipe(i); break; }
+    }
+  }
+  
+  // Update pipes
+  for (int i = 0; i < FLP_MAX_PIPES; i++) {
+    if (!flpPipes[i].active) continue;
+    
+    // Erase old position
+    flpDrawPipe(i, CYBER_BG);
+    
+    // Move
+    flpPipes[i].x -= FLP_PIPE_SPEED;
+    
+    // Off screen
+    if (flpPipes[i].x < -FLP_PIPE_W) {
+      flpPipes[i].active = false;
+      continue;
+    }
+    
+    // Collision check
+    int bx = FLP_BIRD_X, by = (int)flpBirdY;
+    int bx2 = bx + FLP_BIRD_SIZE, by2 = by + FLP_BIRD_SIZE;
+    int px = flpPipes[i].x, px2 = px + FLP_PIPE_W;
+    int topH = flpPipes[i].gapY - FLP_GAP/2;
+    int botY = flpPipes[i].gapY + FLP_GAP/2;
+    
+    if (bx2 > px && bx < px2) {
+      if (by < topH || by2 > botY) {
+        flpGameOver = true;
+        vTone(BUZZ_PIN, 200, 300);
+        return;
+      }
+    }
+    
+    // Score
+    if (!flpPipes[i].scored && flpPipes[i].x + FLP_PIPE_W < FLP_BIRD_X) {
+      flpPipes[i].scored = true;
+      flpScore++;
+      flpDrawScore();
+      vTone(BUZZ_PIN, 1200, 30);
+    }
+    
+    // Draw new position
+    flpDrawPipe(i, CYBER_GREEN);
+  }
+  
+  // Draw bird
+  flpDrawBird(AQ_BAR_YELLOW);
+}
+
+// ============================================================
+// PONG — Landscape mode (160x128), AI opponent
+// ============================================================
+// Layout: Left 130px = game, Right 30px = score panel
+#define PNG_AREA_W 260
+#define PNG_AREA_H 240
+#define PNG_PANEL_X 264
+#define PNG_PAD_W 6
+#define PNG_PAD_H 44
+#define PNG_BALL_SIZE 6
+#define PNG_P1_X 8         // Player paddle X (left side)
+#define PNG_AI_X (PNG_AREA_W - PNG_PAD_W - 4)  // AI paddle X (right side)
+
+float pngBallX, pngBallY, pngBallDX, pngBallDY;
+int pngP1Y, pngAIY;   // Paddle Y positions (top edge)
+int pngScoreP1 = 0, pngScoreAI = 0;
+bool pngGameOver = false, pngInited = false, pngBallActive = false;
+unsigned long pngLastFrame = 0;
+const unsigned long PNG_FRAME_MS = 20;
+int pngWinScore = 7;
+
+void pngDrawPaddle(int x, int y, uint16_t color) {
+  tft.fillRect(x, y, PNG_PAD_W, PNG_PAD_H, color);
+}
+
+void pngDrawBall(uint16_t color) {
+  tft.fillRect((int)pngBallX, (int)pngBallY, PNG_BALL_SIZE, PNG_BALL_SIZE, color);
+}
+
+void pngDrawScores() {
+  tft.fillRect(PNG_PANEL_X, 20, 28, 45, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(PNG_PANEL_X, 20); tft.print("Sen");
+  tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(PNG_PANEL_X, 32); tft.printf("%d", pngScoreP1);
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(PNG_PANEL_X, 48); tft.print("AI");
+  tft.setTextColor(AQ_BAR_RED, CYBER_BG);
+  tft.setCursor(PNG_PANEL_X, 60); tft.printf("%d", pngScoreAI);
+}
+
+void pngDrawCenterLine() {
+  for (int y = 0; y < PNG_AREA_H; y += 8) {
+    tft.drawFastVLine(PNG_AREA_W / 2, y, 6, CYBER_DARK);
+  }
+}
+
+void pngResetBall(int dir) {
+  pngBallActive = false;
+  pngBallX = PNG_AREA_W / 2 - 1;
+  pngBallY = PNG_AREA_H / 2 - 1;
+  pngBallDX = dir * 3.5f;
+  pngBallDY = (random(2) == 0) ? 2.0f : -2.0f;
+}
+
+void initPong() {
+  pngInited = true;
+  pngGameOver = false;
+  pngScoreP1 = 0;
+  pngScoreAI = 0;
+  pngP1Y = PNG_AREA_H / 2 - PNG_PAD_H / 2;
+  pngAIY = PNG_AREA_H / 2 - PNG_PAD_H / 2;
+  pngResetBall(1);
+
+  tft.setRotation(3);
+  tft.fillScreen(CYBER_BG);
+  
+  // Game area border
+  tft.drawFastVLine(PNG_AREA_W, 0, PNG_AREA_H, ST77XX_WHITE);
+  pngDrawCenterLine();
+  
+  // Right panel
+  tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(PNG_PANEL_X, 4); tft.print("PONG");
+  tft.drawFastHLine(PNG_PANEL_X, 15, 26, CYBER_DARK);
+  
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(PNG_PANEL_X, 80); tft.print("Enc");
+  tft.setCursor(PNG_PANEL_X, 90); tft.print(" U/D");
+  tft.setCursor(PNG_PANEL_X, 105); tft.print("Bas");
+  tft.setCursor(PNG_PANEL_X, 115); tft.print(" atla");
+  
+  pngDrawScores();
+  pngDrawPaddle(PNG_P1_X, pngP1Y, CYBER_ACCENT);
+  pngDrawPaddle(PNG_AI_X, pngAIY, AQ_BAR_RED);
+  pngDrawBall(ST77XX_WHITE);
+  
+  // Start text
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, CYBER_BG);
+  tft.setCursor(30, 60); tft.print("Bas: Baslat");
+}
+
+void updatePong(int enc, bool encP, bool back) {
+  if (back) { pngInited=false; currentMode=MODE_GAMES_MENU; drawGamesMenu(); return; }
+  
+  if (pngGameOver) {
+    tft.setTextSize(2);
+    if (pngScoreP1 >= pngWinScore) {
+      tft.setTextColor(CYBER_GREEN, CYBER_BG);
+      tft.setCursor(10, 35); tft.print("KAZANDIN!");
+    } else {
+      tft.setTextColor(ST77XX_RED, CYBER_BG);
+      tft.setCursor(10, 35); tft.print("KAYBETTIN");
+    }
+    tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+    tft.setCursor(20, 65); tft.printf("%d - %d", pngScoreP1, pngScoreAI);
+    tft.setCursor(15, 85); tft.print("Bas: tekrar");
+    if (encP) initPong();
+    return;
+  }
+  
+  // Move player paddle with encoder
+  if (enc != 0) {
+    pngDrawPaddle(PNG_P1_X, pngP1Y, CYBER_BG);
+    pngP1Y = constrain(pngP1Y + enc * 10, 0, PNG_AREA_H - PNG_PAD_H);
+    pngDrawPaddle(PNG_P1_X, pngP1Y, CYBER_ACCENT);
+  }
+  
+  // Launch ball
+  if (encP && !pngBallActive) {
+    pngBallActive = true;
+    // Clear start text
+    tft.fillRect(20, 55, 100, 15, CYBER_BG);
+    pngDrawCenterLine();
+    vTone(BUZZ_PIN, 600, 30);
+  }
+  
+  if (!pngBallActive) return;
+  
+  // Frame timing
+  unsigned long now = millis();
+  if (now - pngLastFrame < PNG_FRAME_MS) return;
+  pngLastFrame = now;
+  
+  // Erase ball
+  pngDrawBall(CYBER_BG);
+  
+  // AI movement — follows ball with slight delay/imperfection
+  int aiTarget = (int)pngBallY - PNG_PAD_H / 2;
+  int aiCenter = pngAIY + PNG_PAD_H / 2;
+  int ballCenter = (int)pngBallY + PNG_BALL_SIZE / 2;
+  if (abs(aiCenter - ballCenter) > 3) {
+    pngDrawPaddle(PNG_AI_X, pngAIY, CYBER_BG);
+    if (aiCenter < ballCenter) pngAIY += 3;
+    else pngAIY -= 2;
+    pngAIY = constrain(pngAIY, 0, PNG_AREA_H - PNG_PAD_H);
+    pngDrawPaddle(PNG_AI_X, pngAIY, AQ_BAR_RED);
+  }
+  
+  // Move ball
+  float newX = pngBallX + pngBallDX;
+  float newY = pngBallY + pngBallDY;
+  
+  // Top/bottom bounce
+  if (newY <= 0 || newY >= PNG_AREA_H - PNG_BALL_SIZE) {
+    pngBallDY = -pngBallDY;
+    newY = pngBallY + pngBallDY;
+    vTone(BUZZ_PIN, 300, 10);
+  }
+  
+  // Player paddle collision (left)
+  if (newX <= PNG_P1_X + PNG_PAD_W && pngBallDX < 0) {
+    if (newY + PNG_BALL_SIZE >= pngP1Y && newY <= pngP1Y + PNG_PAD_H) {
+      pngBallDX = -pngBallDX;
+      // Angle based on hit position
+      float hitPos = ((newY + PNG_BALL_SIZE/2) - pngP1Y) / (float)PNG_PAD_H;
+      pngBallDY = (hitPos - 0.5f) * 4.0f;
+      newX = PNG_P1_X + PNG_PAD_W + 1;
+      // Speed up slightly
+      if (pngBallDX < 3.5f) pngBallDX += 0.1f;
+      vTone(BUZZ_PIN, 800, 20);
+    }
+  }
+  
+  // AI paddle collision (right)
+  if (newX + PNG_BALL_SIZE >= PNG_AI_X && pngBallDX > 0) {
+    if (newY + PNG_BALL_SIZE >= pngAIY && newY <= pngAIY + PNG_PAD_H) {
+      pngBallDX = -pngBallDX;
+      float hitPos = ((newY + PNG_BALL_SIZE/2) - pngAIY) / (float)PNG_PAD_H;
+      pngBallDY = (hitPos - 0.5f) * 4.0f;
+      newX = PNG_AI_X - PNG_BALL_SIZE - 1;
+      if (pngBallDX > -3.5f) pngBallDX -= 0.1f;
+      vTone(BUZZ_PIN, 600, 20);
+    }
+  }
+  
+  // Score — ball passed left edge (AI scores)
+  if (newX < -PNG_BALL_SIZE) {
+    pngScoreAI++;
+    pngDrawScores();
+    if (pngScoreAI >= pngWinScore) { pngGameOver = true; vTone(BUZZ_PIN, 200, 500); return; }
+    vTone(BUZZ_PIN, 300, 200);
+    pngResetBall(1);  // Ball goes toward AI
+    pngDrawBall(ST77XX_WHITE);
+    pngBallActive = true;
+    return;
+  }
+  
+  // Score — ball passed right edge (Player scores)
+  if (newX > PNG_AREA_W) {
+    pngScoreP1++;
+    pngDrawScores();
+    if (pngScoreP1 >= pngWinScore) { pngGameOver = true; vTone(BUZZ_PIN, 1500, 300); return; }
+    vTone(BUZZ_PIN, 1000, 100);
+    pngResetBall(-1);  // Ball goes toward player
+    pngDrawBall(ST77XX_WHITE);
+    pngBallActive = true;
+    return;
+  }
+  
+  pngBallX = newX;
+  pngBallY = newY;
+  pngDrawBall(ST77XX_WHITE);
+  
+  // Redraw center line where ball erased it
+  int centerX = PNG_AREA_W / 2;
+  if (abs((int)pngBallX - centerX) < PNG_BALL_SIZE + 2) pngDrawCenterLine();
+}
+
+// ============================================================
+// 2048 — Landscape mode (160x128)
+// ============================================================
+// Layout: Left 120px = 4x4 grid, Right 40px = score/direction panel
+#define G48_GRID 4
+#define G48_CELL 54       // 4*54=216px
+#define G48_PAD 2
+#define G48_X 4           // Grid start X
+#define G48_Y 12          // Grid start Y
+#define G48_PANEL_X 228
+
+uint16_t g48Board[G48_GRID][G48_GRID];
+int g48Score = 0;
+int g48BestScore = 0;
+int g48Dir = 0;  // 0=up, 1=right, 2=down, 3=left (encoder selects)
+bool g48GameOver = false, g48Inited = false, g48Won = false;
+const char* g48DirNames[] = {"Yukari", "Sag", "Asagi", "Sol"};
+const char* g48DirArrows[] = {"^", ">", "v", "<"};
+
+uint16_t g48Color(uint16_t val) {
+  switch(val) {
+    case 2:    return 0xEF3D;  // light beige
+    case 4:    return 0xEF1A;  // beige
+    case 8:    return 0xFC60;  // orange
+    case 16:   return 0xFB40;  // deep orange
+    case 32:   return 0xFA24;  // red-orange
+    case 64:   return 0xF800;  // red
+    case 128:  return 0xEF00;  // yellow
+    case 256:  return 0xEEA0;  // gold
+    case 512:  return 0xEE40;  // deep gold
+    case 1024: return 0xEE00;  // amber
+    case 2048: return 0x07E0;  // green!
+    default:   return 0x4208;  // empty dark
+  }
+}
+
+void g48DrawCell(int col, int row) {
+  int x = G48_X + col * G48_CELL;
+  int y = G48_Y + row * G48_CELL;
+  uint16_t val = g48Board[row][col];
+  uint16_t bg = g48Color(val);
+  
+  tft.fillRect(x + G48_PAD, y + G48_PAD, G48_CELL - 2*G48_PAD, G48_CELL - 2*G48_PAD, bg);
+  
+  if (val > 0) {
+    tft.setTextColor(val >= 8 ? ST77XX_WHITE : ST77XX_BLACK, bg);
+    char buf[6]; sprintf(buf, "%d", val);
+    int len = strlen(buf);
+    // Size and position based on digits
+    if (val < 100) {
+      tft.setTextSize(2);
+      tft.setCursor(x + (G48_CELL - len*12)/2, y + 8);
+    } else if (val < 1000) {
+      tft.setTextSize(1);
+      tft.setCursor(x + (G48_CELL - len*6)/2, y + 10);
+    } else {
+      tft.setTextSize(1);
+      tft.setCursor(x + 2, y + 10);
+    }
+    tft.print(buf);
+  }
+}
+
+void g48DrawBoard() {
+  for (int r = 0; r < G48_GRID; r++)
+    for (int c = 0; c < G48_GRID; c++)
+      g48DrawCell(c, r);
+}
+
+void g48DrawPanel() {
+  tft.fillRect(G48_PANEL_X, 0, 92, 240, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(G48_PANEL_X, 2); tft.print("2048");
+  tft.drawFastHLine(G48_PANEL_X, 13, 38, CYBER_DARK);
+  
+  // Score
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(G48_PANEL_X, 18); tft.print("Skor");
+  tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(G48_PANEL_X, 30); tft.printf("%d", g48Score);
+  
+  // Best
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(G48_PANEL_X, 44); tft.print("En");
+  tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(G48_PANEL_X, 56); tft.printf("%d", g48BestScore);
+  
+  tft.drawFastHLine(G48_PANEL_X, 68, 38, CYBER_DARK);
+  
+  // Direction indicator
+  g48DrawDir();
+  
+  // Controls
+  tft.setTextColor(CYBER_DARK);
+  tft.setCursor(G48_PANEL_X, 100); tft.print("Cvr:");
+  tft.setCursor(G48_PANEL_X, 110); tft.print(" yon");
+  tft.setCursor(G48_PANEL_X, 122); tft.print("K0:cik");
+}
+
+void g48DrawDir() {
+  tft.fillRect(G48_PANEL_X, 72, 38, 24, CYBER_BG);
+  tft.setTextSize(2); tft.setTextColor(CYBER_ACCENT, CYBER_BG);
+  tft.setCursor(G48_PANEL_X + 8, 73); tft.print(g48DirArrows[g48Dir]);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(G48_PANEL_X, 91); tft.print("Bas:git");
+}
+
+void g48DrawScore() {
+  tft.fillRect(G48_PANEL_X, 28, 38, 12, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(G48_PANEL_X, 30); tft.printf("%d", g48Score);
+}
+
+void g48SpawnTile() {
+  // Find empty cells
+  int empty[16]; int cnt = 0;
+  for (int r = 0; r < G48_GRID; r++)
+    for (int c = 0; c < G48_GRID; c++)
+      if (g48Board[r][c] == 0) empty[cnt++] = r * G48_GRID + c;
+  if (cnt == 0) return;
+  int pick = empty[random(cnt)];
+  int r = pick / G48_GRID, c = pick % G48_GRID;
+  g48Board[r][c] = (random(10) < 9) ? 2 : 4;
+  g48DrawCell(c, r);
+}
+
+bool g48Slide(int dir) {
+  // Returns true if anything moved
+  bool moved = false;
+  uint16_t prev[G48_GRID][G48_GRID];
+  memcpy(prev, g48Board, sizeof(g48Board));
+  
+  // Process based on direction
+  for (int pass = 0; pass < G48_GRID; pass++) {
+    for (int i = 0; i < G48_GRID; i++) {
+      // Build line based on direction
+      uint16_t line[G48_GRID];
+      for (int j = 0; j < G48_GRID; j++) {
+        switch(dir) {
+          case 0: line[j] = g48Board[j][i]; break;        // up: column top to bottom
+          case 1: line[j] = g48Board[i][G48_GRID-1-j]; break; // right: row right to left
+          case 2: line[j] = g48Board[G48_GRID-1-j][i]; break; // down: column bottom to top
+          case 3: line[j] = g48Board[i][j]; break;        // left: row left to right
+        }
+      }
+      
+      if (pass == 0) {
+        // First pass: compact (remove zeros)
+        uint16_t compact[G48_GRID] = {0};
+        int ci = 0;
+        for (int j = 0; j < G48_GRID; j++) if (line[j] > 0) compact[ci++] = line[j];
+        memcpy(line, compact, sizeof(line));
+      } else if (pass == 1) {
+        // Second pass: merge adjacent equal
+        for (int j = 0; j < G48_GRID - 1; j++) {
+          if (line[j] > 0 && line[j] == line[j+1]) {
+            line[j] *= 2;
+            g48Score += line[j];
+            if (line[j] == 2048) g48Won = true;
+            line[j+1] = 0;
+          }
+        }
+      } else if (pass == 2) {
+        // Third pass: compact again
+        uint16_t compact[G48_GRID] = {0};
+        int ci = 0;
+        for (int j = 0; j < G48_GRID; j++) if (line[j] > 0) compact[ci++] = line[j];
+        memcpy(line, compact, sizeof(line));
+      }
+      
+      // Write back
+      for (int j = 0; j < G48_GRID; j++) {
+        switch(dir) {
+          case 0: g48Board[j][i] = line[j]; break;
+          case 1: g48Board[i][G48_GRID-1-j] = line[j]; break;
+          case 2: g48Board[G48_GRID-1-j][i] = line[j]; break;
+          case 3: g48Board[i][j] = line[j]; break;
+        }
+      }
+    }
+  }
+  
+  // Check if anything changed
+  for (int r = 0; r < G48_GRID; r++)
+    for (int c = 0; c < G48_GRID; c++)
+      if (g48Board[r][c] != prev[r][c]) moved = true;
+  
+  return moved;
+}
+
+bool g48CanMove() {
+  for (int r = 0; r < G48_GRID; r++)
+    for (int c = 0; c < G48_GRID; c++) {
+      if (g48Board[r][c] == 0) return true;
+      if (c < G48_GRID-1 && g48Board[r][c] == g48Board[r][c+1]) return true;
+      if (r < G48_GRID-1 && g48Board[r][c] == g48Board[r+1][c]) return true;
+    }
+  return false;
+}
+
+void init2048() {
+  g48Inited = true;
+  g48GameOver = false;
+  g48Won = false;
+  g48Score = 0;
+  g48Dir = 0;
+  memset(g48Board, 0, sizeof(g48Board));
+  
+  tft.setRotation(3);
+  tft.fillScreen(CYBER_BG);
+  
+  // Spawn 2 initial tiles
+  g48SpawnTile();
+  g48SpawnTile();
+  
+  g48DrawBoard();
+  g48DrawPanel();
+}
+
+void update2048(int enc, bool encP, bool back) {
+  if (back) { g48Inited=false; currentMode=MODE_GAMES_MENU; drawGamesMenu(); return; }
+  
+  if (g48GameOver) {
+    tft.setTextSize(2); tft.setTextColor(ST77XX_RED, CYBER_BG);
+    tft.setCursor(15, 45); tft.print("BITTI!");
+    tft.setTextSize(1); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+    tft.setCursor(15, 70); tft.printf("Skor: %d", g48Score);
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(10, 90); tft.print("Bas: tekrar");
+    if (encP) init2048();
+    return;
+  }
+  
+  if (g48Won) {
+    tft.setTextSize(2); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+    tft.setCursor(5, 45); tft.print("2048!!!");
+    tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+    tft.setCursor(10, 70); tft.printf("Skor: %d", g48Score);
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(10, 90); tft.print("Bas: devam");
+    if (encP) { g48Won = false; g48DrawBoard(); g48DrawPanel(); }
+    return;
+  }
+  
+  // Encoder: select direction
+  if (enc != 0) {
+    g48Dir = (g48Dir + enc + 4) % 4;
+    g48DrawDir();
+  }
+  
+  // Encoder press: execute move
+  if (encP) {
+    bool moved = g48Slide(g48Dir);
+    if (moved) {
+      g48SpawnTile();
+      g48DrawBoard();
+      g48DrawScore();
+      vTone(BUZZ_PIN, 600, 30);
+      
+      if (g48Score > g48BestScore) {
+        g48BestScore = g48Score;
+        tft.fillRect(G48_PANEL_X, 54, 38, 12, CYBER_BG);
+        tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+        tft.setCursor(G48_PANEL_X, 56); tft.printf("%d", g48BestScore);
+      }
+      
+      if (!g48CanMove()) {
+        g48GameOver = true;
+        vTone(BUZZ_PIN, 200, 500);
+      }
+    } else {
+      vTone(BUZZ_PIN, 300, 50);  // Can't move in that direction
+    }
+  }
+}
+
+// ============================================================
+// SMART HOME — HA Control via MQTT
+// ============================================================
+// Forward declaration
+void drawMenu();
+// HA publishes room/device JSON to cyberclock/home/config
+// Clock subscribes and builds menu from it
+// User actions publish to homeassistant/<domain>/<entity>/set
+//
+// JSON format from HA:
+// [{"r":"Salon","d":[{"n":"Tavan Isik","t":"light","e":"light.salon_tavan","s":"off"},
+//                    {"n":"Priz","t":"switch","e":"switch.salon_priz","s":"off"}]},
+//  {"r":"Yatak","d":[{"n":"Klima","t":"climate","e":"climate.yatak_klima","s":"off"}]}]
+
+#define HOME_MAX_ROOMS 8
+#define HOME_MAX_DEVICES 6   // Per room
+#define HOME_MAX_NAME 16
+#define HOME_MAX_ENTITY 64
+
+#define TOPIC_HOME_CONFIG  TOPIC_PREFIX "/home/config"
+#define TOPIC_HOME_REQUEST TOPIC_PREFIX "/home/request"
+#define TOPIC_HOME_STATE   TOPIC_PREFIX "/home/state"
+
+struct HomeDevice {
+  char name[HOME_MAX_NAME];
+  char type[10];        // "light", "switch", "climate"
+  char entity[HOME_MAX_ENTITY];  // HA entity_id
+  char state[8];        // "on", "off", "25" (brightness)
+  uint8_t brightness;   // For lights: 0-255
+};
+
+struct HomeRoom {
+  char name[HOME_MAX_NAME];
+  HomeDevice devices[HOME_MAX_DEVICES];
+  int deviceCount;
+};
+
+HomeRoom homeRooms[HOME_MAX_ROOMS];
+int homeRoomCount = 0;
+int homeMenuLevel = 0;   // 0=room list, 1=device list, 2=device control
+int homeRoomIdx = 0;
+int homeDevIdx = 0;
+bool homeLoaded = false;
+bool homeInited = false;
+
+void homeParseConfig(const char* json) {
+  // Parse JSON device config from HA
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) { Serial.printf("Home JSON error: %s\n", err.c_str()); return; }
+  
+  homeRoomCount = 0;
+  JsonArray rooms = doc.as<JsonArray>();
+  for (JsonObject room : rooms) {
+    if (homeRoomCount >= HOME_MAX_ROOMS) break;
+    HomeRoom &hr = homeRooms[homeRoomCount];
+    strlcpy(hr.name, room["r"] | "?", HOME_MAX_NAME);
+    hr.deviceCount = 0;
+    JsonArray devs = room["d"];
+    for (JsonObject dev : devs) {
+      if (hr.deviceCount >= HOME_MAX_DEVICES) break;
+      HomeDevice &hd = hr.devices[hr.deviceCount];
+      strlcpy(hd.name, dev["n"] | "?", HOME_MAX_NAME);
+      strlcpy(hd.type, dev["t"] | "?", 10);
+      strlcpy(hd.entity, dev["e"] | "", HOME_MAX_ENTITY);
+      strlcpy(hd.state, dev["s"] | "off", 8);
+      hd.brightness = dev["b"] | 0;
+      hr.deviceCount++;
+    }
+    homeRoomCount++;
+  }
+  homeLoaded = true;
+  Serial.printf("Home config: %d rooms loaded\n", homeRoomCount);
+}
+
+#define TOPIC_HOME_CMD TOPIC_PREFIX "/home/command"
+
+// Dimmer speed tracking
+unsigned long lastDimmerEncMs = 0;
+
+int calcDimmerDelta(bool up) {
+  unsigned long now = millis();
+  unsigned long elapsed = now - lastDimmerEncMs;
+  lastDimmerEncMs = now;
+
+  int pct;
+  if (elapsed < 50)       pct = 25;  // very fast rotation
+  else if (elapsed < 120) pct = 10;  // fast
+  else if (elapsed < 250) pct = 5;   // medium
+  else                    pct = 1;   // slow
+
+  int delta = (255 * pct) / 100;
+  if (delta < 1) delta = 1;
+  return up ? delta : -delta;
+}
+
+void homePublishCommand(int roomIdx, int devIdx, const char* cmd, int brightDelta = 0) {
+  HomeDevice &dev = homeRooms[roomIdx].devices[devIdx];
+  if (!mqttClient.connected()) return;
+
+  // Send command to HA via single topic — HA automation handles service calls
+  // Format: {"e":"light.salon","c":"toggle"} or {"e":"light.salon","c":"bright_up","b":180}
+  JsonDocument doc;
+  doc["e"] = dev.entity;
+  doc["t"] = dev.type;
+
+  if (strcmp(cmd, "toggle") == 0) {
+    doc["c"] = "toggle";
+    // Don't optimistically update — wait for HA state callback
+  }
+  else if (strcmp(cmd, "bright") == 0) {
+    dev.brightness = constrain((int)dev.brightness + brightDelta, 0, 255);
+    doc["c"] = (brightDelta > 0) ? "bright_up" : "bright_down";
+    doc["b"] = dev.brightness;
+    strlcpy(dev.state, "on", 8);
+  }
+
+  char buf[128]; serializeJson(doc, buf);
+  mqttClient.publish(TOPIC_HOME_CMD, buf);
+}
+
+void homeRequestConfig() {
+  // Ask HA to send the config (HA automation listens for this)
+  if (mqttClient.connected()) {
+    mqttClient.publish(TOPIC_HOME_REQUEST, "refresh", true);
+  }
+}
+
+void drawHomeScreen() {
+  tft.fillScreen(CYBER_BG);
+  tft.setTextSize(1);
+  
+  if (!homeLoaded || homeRoomCount == 0) {
+    tft.setTextSize(2);tft.setTextColor(CYBER_LIGHT); tft.setCursor(16, 8); tft.print("AKILLI EV");
+    tft.setTextSize(1);tft.setTextColor(CYBER_DARK); tft.setCursor(240, 14); tft.print("K0:geri");
+    tft.setTextSize(2);tft.setTextColor(ST77XX_WHITE, CYBER_BG);
+    tft.setCursor(20, 70); tft.print("Cihaz listesi");
+    tft.setCursor(20, 95); tft.print("bekleniyor...");
+    tft.setTextSize(1);tft.setTextColor(CYBER_DARK);
+    tft.setCursor(20, 140); tft.print("HA otomasyonu gerekli.");
+    tft.setCursor(20, 165); tft.print("Bas: yenile");
+    return;
+  }
+  
+  if (homeMenuLevel == 0) {
+    // Room list
+    tft.setTextSize(2);tft.setTextColor(CYBER_LIGHT); tft.setCursor(16, 8); tft.print("ODALAR");
+    tft.setTextSize(1);tft.setTextColor(CYBER_DARK); tft.setCursor(240, 14); tft.print("K0:geri");
+    drawAlarmIcon();
+    tft.setTextSize(2);
+    for (int i = 0; i < homeRoomCount; i++) {
+      int y = 40 + i * 28;
+      if (i == homeRoomIdx) { tft.fillRoundRect(8, y-2, 304, 24, 4, CYBER_ACCENT); tft.setTextColor(CYBER_BG); }
+      else { tft.fillRoundRect(8, y-2, 304, 24, 4, 0x18E3); tft.setTextColor(ST77XX_WHITE); }
+      tft.setCursor(20, y+2); tft.print(homeRooms[i].name);
+      char cnt[6]; sprintf(cnt, "(%d)", homeRooms[i].deviceCount);
+      tft.setCursor(260, y+2); tft.print(cnt);
+    }
+  }
+  else if (homeMenuLevel == 1) {
+    // Device list for selected room
+    HomeRoom &room = homeRooms[homeRoomIdx];
+    tft.setTextSize(2);tft.setTextColor(CYBER_LIGHT); tft.setCursor(16, 8); tft.print(room.name);
+    tft.setTextSize(1);tft.setTextColor(CYBER_DARK); tft.setCursor(240, 14); tft.print("K0:geri");
+    drawAlarmIcon();
+    tft.setTextSize(2);
+    for (int i = 0; i < room.deviceCount; i++) {
+      int y = 40 + i * 30;
+      HomeDevice &dev = room.devices[i];
+      if (i == homeDevIdx) { tft.fillRoundRect(8, y-2, 304, 26, 4, CYBER_ACCENT); tft.setTextColor(CYBER_BG); }
+      else { tft.fillRoundRect(8, y-2, 304, 26, 4, 0x18E3); tft.setTextColor(ST77XX_WHITE); }
+      tft.setCursor(20, y+2); tft.print(dev.name);
+      uint16_t sc = (strcmp(dev.state, "on") == 0) ? CYBER_GREEN : ST77XX_RED;
+      if (i == homeDevIdx) sc = CYBER_BG;
+      tft.setTextColor(sc);
+      tft.setCursor(260, y+2);
+      if (strcmp(dev.state, "on") == 0) tft.print("ON");
+      else tft.print("OFF");
+    }
+    tft.setTextSize(1);tft.setTextColor(CYBER_DARK); tft.setCursor(8, 225);
+    tft.print("Bas:ac/kapa Cvr:sec");
+  }
+  else if (homeMenuLevel == 2) {
+    // Device control (for lights with brightness)
+    HomeRoom &room = homeRooms[homeRoomIdx];
+    HomeDevice &dev = room.devices[homeDevIdx];
+    tft.setTextSize(2);tft.setTextColor(CYBER_LIGHT); tft.setCursor(16, 8); tft.print(dev.name);
+    tft.setTextSize(1);tft.setTextColor(CYBER_DARK); tft.setCursor(240, 14); tft.print("K0:geri");
+    
+    // On/Off status
+    tft.setTextSize(4);
+    if (strcmp(dev.state, "on") == 0) { tft.setTextColor(CYBER_GREEN, CYBER_BG); tft.setCursor(60, 50); tft.print("ACIK"); }
+    else { tft.setTextColor(ST77XX_RED, CYBER_BG); tft.setCursor(60, 50); tft.print("KAPALI"); }
+    
+    // Brightness bar (for lights)
+    if (strcmp(dev.type, "light") == 0) {
+      tft.setTextSize(2); tft.setTextColor(CYBER_DARK);
+      tft.setCursor(16, 110); tft.print("Parlaklik:");
+      int barW = map(dev.brightness, 0, 255, 0, 260);
+      tft.fillRect(16, 135, 280, 16, CYBER_DARK);
+      tft.fillRect(16, 135, barW, 16, CYBER_LIGHT);
+      char pct[8]; sprintf(pct, "%d%%", map(dev.brightness, 0, 255, 0, 100));
+      tft.setTextColor(ST77XX_WHITE, CYBER_BG);
+      tft.setCursor(120, 160); tft.print(pct);
+    }
+    
+    tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+    tft.setCursor(8, 200); tft.print("Bas:ac/kapa");
+    if (strcmp(dev.type, "light") == 0) {
+      tft.setCursor(8, 215); tft.print("Cvr:parlaklik K0:geri");
+    }
+  }
+}
+
+void initHome() {
+  homeInited = true;
+  homeMenuLevel = 0;
+  homeRoomIdx = 0;
+  homeDevIdx = 0;
+  homeRequestConfig();  // Ask HA to send device list
+  drawHomeScreen();
+}
+
+void updateHome(int enc, bool encP, bool back) {
+  if (back) {
+    if (homeMenuLevel == 0) { homeInited=false; currentMode=MODE_MENU; drawMenu(); return; }
+    else if (homeMenuLevel == 1) { homeMenuLevel = 0; homeDevIdx = 0; drawHomeScreen(); return; }
+    else { homeMenuLevel = 1; drawHomeScreen(); return; }
+  }
+  
+  if (!homeLoaded || homeRoomCount == 0) {
+    // Waiting for config — press to refresh
+    if (encP) { homeRequestConfig(); vTone(BUZZ_PIN, 800, 50); }
+    return;
+  }
+  
+  if (homeMenuLevel == 0) {
+    // Room selection
+    if (enc != 0) {
+      homeRoomIdx += enc;
+      if (homeRoomIdx < 0) homeRoomIdx = homeRoomCount - 1;
+      if (homeRoomIdx >= homeRoomCount) homeRoomIdx = 0;
+      drawHomeScreen();
+    }
+    if (encP) {
+      homeMenuLevel = 1;
+      homeDevIdx = 0;
+      drawHomeScreen();
+    }
+  }
+  else if (homeMenuLevel == 1) {
+    // Device selection
+    HomeRoom &room = homeRooms[homeRoomIdx];
+    if (enc != 0) {
+      homeDevIdx += enc;
+      if (homeDevIdx < 0) homeDevIdx = room.deviceCount - 1;
+      if (homeDevIdx >= room.deviceCount) homeDevIdx = 0;
+      drawHomeScreen();
+    }
+    if (encP) {
+      if (strcmp(homeRooms[homeRoomIdx].devices[homeDevIdx].type, "light") == 0) {
+        homeMenuLevel = 2;
+        homePublishCommand(homeRoomIdx, homeDevIdx, "toggle");
+        drawHomeScreen();
+      } else {
+        homePublishCommand(homeRoomIdx, homeDevIdx, "toggle");
+        vTone(BUZZ_PIN, 1000, 50);
+        drawHomeScreen();
+      }
+    }
+  }
+  else if (homeMenuLevel == 2) {
+    // Light brightness control — speed-based delta
+    if (enc != 0) {
+      int delta = calcDimmerDelta(enc > 0);
+      homePublishCommand(homeRoomIdx, homeDevIdx, "bright", delta);
+      drawHomeScreen();
+    }
+    if (encP) {
+      homePublishCommand(homeRoomIdx, homeDevIdx, "toggle");
+      drawHomeScreen();
+      vTone(BUZZ_PIN, 1000, 50);
+    }
+  }
+}
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+int readEncoderStep() {
+  int encA = digitalRead(ENC_A_PIN), encB = digitalRead(ENC_B_PIN);
+  int step = 0;
+  if (encA != lastEncA) { if (encA == LOW) step = (encB == HIGH) ? +1 : -1; }
+  lastEncA = encA; lastEncB = encB;
+  return step;
+}
+
+bool checkButtonPressed(uint8_t pin, bool &lastState) {
+  bool cur = digitalRead(pin);
+  bool pressed = false;
+  unsigned long now = millis();
+  if (cur == LOW && lastState == HIGH && (now - lastBtnMs) > 150) { pressed = true; lastBtnMs = now; }
+  lastState = cur;
+  return pressed;
+}
+
+void drawAlarmIcon() {
+  int x = 308;
+  tft.fillRect(x-14, 0, 18, 18, CYBER_BG);
+  if (!alarmEnabled) return;
+  uint16_t c = CYBER_LIGHT;
+  tft.drawRoundRect(x-9, 2, 10, 7, 2, c);
+  tft.drawFastHLine(x-8, 8, 8, c);
+  tft.fillCircle(x-4, 10, 1, c);
+}
+
+// ============================================================
+// MELODY PLAYER
+// ============================================================
+void startMelody(const int* notes, const int* durs, int len, bool loop) {
+  melodyNotes=notes; melodyDurs=durs; melodyLen=len; melodyIdx=0;
+  melodyPlaying=true; melodyLoop=loop; melodyLastMs=millis();
+  if (notes[0]>0) vTone(BUZZ_PIN, notes[0], durs[0]);
+}
+
+void stopMelody() { melodyPlaying=false; vToneStop(); }
+
+void updateMelody() {
+  if (!melodyPlaying) return;
+  unsigned long now = millis();
+  unsigned long noteDur = (unsigned long)melodyDurs[melodyIdx];
+  // Play note for 90% of duration, silent for 10% (staccato effect)
+  unsigned long playTime = noteDur * 9 / 10;
+  if (now - melodyLastMs >= playTime && buzzAttached && melodyNotes[melodyIdx] > 0) {
+    vToneStop();  // brief silence before next note
+  }
+  if (now - melodyLastMs >= noteDur) {
+    melodyIdx++;
+    if (melodyIdx >= melodyLen) { if(melodyLoop) melodyIdx=0; else { stopMelody(); return; } }
+    melodyLastMs = now;
+    if (melodyNotes[melodyIdx] > 0) vTone(BUZZ_PIN, melodyNotes[melodyIdx], melodyDurs[melodyIdx]);
+    else vToneStop();
+  }
+}
+
+// ============================================================
+// BACKLIGHT
+// ============================================================
+void updateBacklight() {
+  // Don't override dim/sleep brightness
+  if (screenDimmed || screenSleeping) return;
+  analogWrite(BL_PIN, backlightLevel);
+}
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+void drawMenu();
+void drawGamesMenu();
+void drawAlarmScreen(bool full);
+void drawPomodoroScreen(bool full);
+void drawBrightnessScreen(bool full);
+void drawSettingsScreen(bool full);
+void initClockStaticUI();
+void drawDate();
+void drawWeather();
+void drawClockTime(String hS, String mS, String sS);
+void drawEnvDynamic(float t, float h, uint16_t tv, uint16_t e);
+void drawAlarmRingingScreen();
+void updateEnvSensors(bool force=false);
+String getTimeStr(char type);
+
+// ============================================================
+// SLEEP MODE
+// ============================================================
+void enterDim() {
+  if (screenDimmed || screenSleeping) return;
+  screenDimmed = true;
+  dimStartMs = millis();
+  analogWrite(BL_PIN, constrain(backlightLevel * 1 / 100, 1, 3));  // ~1% brightness
+  Serial.println("Screen dimmed");
+}
+
+void exitDim() {
+  if (!screenDimmed) return;
+  screenDimmed = false;
+  analogWrite(BL_PIN, backlightLevel);  // Restore full brightness
+}
+
+void enterSleep() {
+  if (screenSleeping) return;
+  screenSleeping = true;
+  screenDimmed = false;
+  preSleepMode = currentMode;
+  currentMode = MODE_SLEEP;
+  
+  // Restore landscape if in Tetris portrait mode
+  // Tetris now uses landscape — no rotation restore needed
+  
+  // Turn off backlight completely
+  analogWrite(BL_PIN, 0);
+  
+  // Publish sleep state to HA
+  if (mqttClient.connected()) {
+    mqttClient.publish(TOPIC_SLEEP_STATE, "ON", true);
+  }
+  Serial.println("Sleep mode ON — backlight OFF");
+}
+
+void wakeUp() {
+  if (!screenSleeping) return;
+  screenSleeping = false;
+  screenDimmed = false;
+  lastActivityMs = millis();
+  
+  // Restore backlight
+  analogWrite(BL_PIN, backlightLevel);
+  
+  // Restore previous mode
+  currentMode = preSleepMode;
+  
+  // Redraw current screen
+  switch (currentMode) {
+    case MODE_CLOCK:
+      initClockStaticUI(); prevTimeStr = "";
+      drawClockTime(getTimeStr('H'), getTimeStr('M'), getTimeStr('S'));
+      drawEnvDynamic(curTemp, curHum, curTVOC, curECO2);
+      break;
+    case MODE_MENU: drawMenu(); break;
+    case MODE_GAMES_MENU: drawGamesMenu(); break;
+    case MODE_POMODORO: drawPomodoroScreen(true); break;
+    case MODE_ALARM: drawAlarmScreen(true); break;
+    case MODE_BRIGHT: drawBrightnessScreen(true); break;
+    case MODE_SETTINGS: drawSettingsScreen(true); break;
+    default: 
+      currentMode = MODE_CLOCK;
+      initClockStaticUI(); prevTimeStr = "";
+      drawClockTime(getTimeStr('H'), getTimeStr('M'), getTimeStr('S'));
+      drawEnvDynamic(curTemp, curHum, curTVOC, curECO2);
+      break;
+  }
+  
+  // Publish wake state to HA
+  if (mqttClient.connected()) {
+    mqttClient.publish(TOPIC_SLEEP_STATE, "OFF", true);
+  }
+  Serial.println("Sleep mode OFF");
+}
+
+void resetActivityTimer() {
+  lastActivityMs = millis();
+}
+
+// Publish LED ON/OFF state + dimmer brightness + mode to HA
+void publishBacklightState() {
+  if (!mqttClient.connected()) return;
+  char buf[8]; sprintf(buf, "%d", backlightLevel);
+  mqttClient.publish(TOPIC_BL_STATE, buf, true);
+}
+
+void drawBrightnessScreen(bool full) {
+  if (full) { tft.fillScreen(CYBER_BG); tft.setTextSize(2); tft.setCursor(16,10);
+    tft.setTextColor(CYBER_LIGHT); tft.print("PARLAKLIK"); drawAlarmIcon(); }
+  
+  // Brightness percentage
+  int pct = map(backlightLevel, 0, 255, 0, 100);
+  tft.fillRect(20, 55, 280, 45, CYBER_BG);
+  tft.setTextSize(5); tft.setTextColor(CYBER_ACCENT, CYBER_BG);
+  char buf[8]; sprintf(buf, "%d%%", pct);
+  int16_t bx,by; uint16_t bw,bh;
+  tft.getTextBounds(buf,0,0,&bx,&by,&bw,&bh);
+  tft.setCursor((320-bw)/2, 60); tft.print(buf);
+  
+  // Bar
+  tft.fillRect(30, 120, 260, 20, CYBER_DARK);
+  int barW = map(backlightLevel, 0, 255, 0, 260);
+  tft.fillRect(30, 120, barW, 20, CYBER_ACCENT);
+  
+  // Min/Max labels
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(30, 148); tft.print("0%");
+  tft.setCursor(265, 148); tft.print("100%");
+  
+  tft.fillRect(0, 190, 320, 50, CYBER_BG);
+  tft.setTextSize(2); tft.setTextColor(CYBER_DARK); tft.setCursor(16, 195);
+  tft.print("Cevir: ayarla");
+  tft.setTextSize(1); tft.setCursor(16, 220); tft.print("K0: geri");
+}
+
+// ============================================================
+// SETTINGS SCREEN (Volume + Calibration + Auto Sleep)
+// ============================================================
+int settingsField = 0;
+const int SETTINGS_COUNT = 5;
+
+// Auto-sleep timeout options (milliseconds, 0=disabled)
+const unsigned long sleepOptions[] = {0, 30000, 60000, 120000, 300000};
+const char* sleepLabels[] = {"Kapali", "30sn", "1dk", "2dk", "5dk"};
+const int SLEEP_OPTION_COUNT = 5;
+int sleepOptionIndex = 2;  // Default: 1dk (60000ms)
+
+int getSleepOptionIndex() {
+  for (int i = 0; i < SLEEP_OPTION_COUNT; i++) {
+    if (sleepOptions[i] == sleepTimeoutMs) return i;
+  }
+  return 0;
+}
+
+void drawSettingsScreen(bool full) {
+  if (full) {
+    tft.fillScreen(CYBER_BG); tft.setTextSize(2); tft.setCursor(16,10);
+    tft.setTextColor(CYBER_LIGHT); tft.print("AYARLAR"); drawAlarmIcon();
+    sleepOptionIndex = getSleepOptionIndex();
+  }
+
+  const char* labels[] = {"Ses:", "Sicaklik:", "Nem:", "Oto Uyku:", "Alarm Sesi:"};
+  char values[5][20];
+  sprintf(values[0], "%d%%", volumeLevel);
+  if (tempOffset >= 0) sprintf(values[1], "+%.1fC", tempOffset);
+  else sprintf(values[1], "%.1fC", tempOffset);
+  if (humOffset >= 0) sprintf(values[2], "+%.1f%%", humOffset);
+  else sprintf(values[2], "%.1f%%", humOffset);
+  sprintf(values[3], "%s", sleepLabels[sleepOptionIndex]);
+  sprintf(values[4], "%s", rtttlNames[selectedAlarm]);
+
+  for (int i = 0; i < SETTINGS_COUNT; i++) {
+    int y = 38 + i * 37;
+    tft.fillRect(8, y-2, 304, 34, CYBER_BG);
+    tft.setTextSize(1);
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(16, y); tft.print(labels[i]);
+    tft.setTextSize(2);
+    if (i == settingsField) {
+      tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+    } else {
+      tft.setTextColor(ST77XX_WHITE, CYBER_BG);
+    }
+    tft.setCursor(16, y + 14); tft.print(values[i]);
+    if (i == settingsField) {
+      tft.setTextColor(CYBER_ACCENT);
+      tft.setCursor(295, y + 14); tft.print("<");
+    }
+  }
+
+  tft.fillRect(0, 225, 320, 15, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_DARK);
+  tft.setCursor(8, 228);
+  tft.printf("Okunan: %.1fC %.1f%%", curTemp, curHum);
+}
+
+// ============================================================
+// WiFi
+// ============================================================
+void connectWiFiAndSyncTime() {
+  tft.fillScreen(CYBER_BG); tft.setTextColor(CYBER_LIGHT); tft.setTextSize(1);
+  tft.setCursor(20,60); tft.print("Connecting WiFi...");
+  WiFi.disconnect(true); delay(500); WiFi.mode(WIFI_STA); delay(100);
+  WiFi.begin(ssid, password);
+  uint8_t retry=0;
+  while(WiFi.status()!=WL_CONNECTED&&retry<40){delay(500);tft.print(".");retry++;}
+  if(WiFi.status()==WL_CONNECTED){
+    tft.fillScreen(CYBER_BG); tft.setCursor(20,60); tft.setTextColor(CYBER_GREEN);
+    tft.print("WiFi OK: "); tft.print(WiFi.localIP());
+    configTime(gmtOffset_sec,daylightOffset_sec,ntpServer);
+    tft.setCursor(20,85); tft.print("Time synced (GMT+3)"); delay(500);
+    mqttClient.setServer(mqtt_server,mqtt_port); mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(2048);  // Larger buffer for home config JSON
+    tft.setCursor(20,110); tft.print("MQTT connecting...");
+    connectMqtt();
+    tft.setCursor(20,135); if(mqttClient.connected()){tft.setTextColor(CYBER_GREEN);tft.print("MQTT OK!");}
+    else{tft.setTextColor(AQ_BAR_ORANGE);tft.print("MQTT retry later...");}
+    delay(800);
+  } else {
+    tft.fillScreen(CYBER_BG); tft.setCursor(20,85); tft.setTextColor(ST77XX_RED);
+    tft.print("WiFi FAILED!"); delay(1500);
+  }
+}
+
+String getTimeStr(char type) {
+  struct tm ti; if(!getLocalTime(&ti)) return "--";
+  char buf[8];
+  if(type=='H')strftime(buf,sizeof(buf),"%H",&ti);
+  else if(type=='M')strftime(buf,sizeof(buf),"%M",&ti);
+  else if(type=='S')strftime(buf,sizeof(buf),"%S",&ti);
+  return String(buf);
+}
+
+// ============================================================
+// MQTT
+// ============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg=""; for(unsigned int i=0;i<length;i++) msg+=(char)payload[i]; msg.trim();
+  String tp = String(topic);
+  
+  // Alarm ON/OFF from HA
+  if(tp==TOPIC_ALARM_SET){
+    if(msg=="ON") alarmEnabled=true; else if(msg=="OFF"){alarmEnabled=false; if(alarmRinging){alarmRinging=false;stopMelody();}}
+    mqttClient.publish(TOPIC_ALARM_STATE,alarmEnabled?"ON":"OFF",true); drawAlarmIcon();
+  }
+  
+  // Buzzer from HA
+  if(tp==TOPIC_BUZZER_SET) {
+    playAlarmByIndex(selectedAlarm,false);
+  }
+  
+  // Backlight from HA (0-255)
+  if(tp==TOPIC_BL_SET){
+    int v=msg.toInt();
+    backlightLevel=constrain(v,5,255);
+    analogWrite(BL_PIN,backlightLevel);
+    publishBacklightState();  // Backlight state
+    if(currentMode==MODE_BRIGHT) drawBrightnessScreen(false);
+    saveSettings();
+  }
+  
+  
+  
+  
+  // Volume from HA
+  if(tp==TOPIC_VOL_SET){
+    int v=msg.toInt(); volumeLevel=constrain(v,0,100);
+    char b[8]; sprintf(b,"%d",volumeLevel);
+    mqttClient.publish(TOPIC_VOL_STATE,b,true);
+    saveSettings();
+  }
+  
+  // Temperature calibration from HA
+  if(tp==TOPIC_TCAL_SET){
+    tempOffset=constrain(msg.toFloat(),-15.0f,15.0f);
+    char b[8]; dtostrf(tempOffset,4,1,b);
+    mqttClient.publish(TOPIC_TCAL_STATE,b,true);
+    saveSettings();
+  }
+  
+  // Humidity calibration from HA
+  if(tp==TOPIC_HCAL_SET){
+    humOffset=constrain(msg.toFloat(),-20.0f,20.0f);
+    char b[8]; dtostrf(humOffset,4,1,b);
+    mqttClient.publish(TOPIC_HCAL_STATE,b,true);
+    saveSettings();
+  }
+  
+  // Sleep mode from HA
+  if(tp==TOPIC_SLEEP_SET){
+    if(msg=="ON") enterSleep();
+    else if(msg=="OFF") wakeUp();
+  }
+  
+  // Auto-sleep enable/disable from HA (persistent)
+  if(tp==TOPIC_AUTOSLEEP_SET){
+    if(msg=="ON"){
+      if(sleepTimeoutMs==0){ sleepTimeoutMs=60000; sleepOptionIndex=2; }  // Default 1min
+    } else if(msg=="OFF"){
+      sleepTimeoutMs=0; sleepOptionIndex=0;
+    }
+    mqttClient.publish(TOPIC_AUTOSLEEP_STATE, sleepTimeoutMs>0?"ON":"OFF", true);
+    resetActivityTimer();
+    saveSettings();
+    if(currentMode==MODE_SETTINGS) drawSettingsScreen(false);
+  }
+  
+  // Smart Home config from HA
+  if(tp==TOPIC_HOME_CONFIG){
+    homeParseConfig(msg.c_str());
+    if(currentMode==MODE_HOME) drawHomeScreen();
+  }
+  
+  // Smart Home state updates from HA (individual device)
+  // Format: cyberclock/home/state with JSON {"e":"light.salon","s":"on","b":128}
+  if(tp==TOPIC_HOME_STATE){
+    JsonDocument sdoc;
+    if(!deserializeJson(sdoc, msg)){
+      const char* eid = sdoc["e"] | "";
+      const char* st = sdoc["s"] | "";
+      int br = sdoc["b"] | -1;
+      // Find device and update
+      for(int r=0;r<homeRoomCount;r++)
+        for(int d=0;d<homeRooms[r].deviceCount;d++){
+          if(strcmp(homeRooms[r].devices[d].entity, eid)==0){
+            if(strlen(st)>0) strlcpy(homeRooms[r].devices[d].state, st, 8);
+            if(br>=0) homeRooms[r].devices[d].brightness = br;
+          }
+        }
+      if(currentMode==MODE_HOME) drawHomeScreen();
+    }
+  }
+
+  // Weather data from HA
+  // Format: {"temp":18.5,"hum":45,"cond":"Açık","wind":12.3}
+  if(tp==TOPIC_WEATHER){
+    JsonDocument wdoc;
+    if(!deserializeJson(wdoc, msg)){
+      weatherTemp = wdoc["temp"] | 0.0f;
+      weatherHum = wdoc["hum"] | 0;
+      weatherWind = wdoc["wind"] | 0.0f;
+      const char* c = wdoc["cond"] | "";
+      strlcpy(weatherCond, c, sizeof(weatherCond));
+      weatherValid = true;
+      if(currentMode==MODE_CLOCK) drawWeather();
+    }
+  }
+}
+
+void publishMqttDiscovery() {
+  // Sensors + Alarm + Buzzer
+  struct{const char*c;const char*id;const char*n;const char*st;const char*ct;const char*u;const char*dc;}
+  ent[]={
+    {"sensor","cyberclock_temp","Cyber Clock Temperature",TOPIC_TEMP,NULL,"°C","temperature"},
+    {"sensor","cyberclock_hum","Cyber Clock Humidity",TOPIC_HUM,NULL,"%","humidity"},
+    {"sensor","cyberclock_tvoc","Cyber Clock TVOC",TOPIC_TVOC,NULL,"ppb",NULL},
+    {"sensor","cyberclock_co2","Cyber Clock CO2",TOPIC_CO2,NULL,"ppm","carbon_dioxide"},
+    {"switch","cyberclock_alarm","Cyber Clock Alarm",TOPIC_ALARM_STATE,TOPIC_ALARM_SET,NULL,NULL},
+    {"button","cyberclock_buzzer","Cyber Clock Buzzer",NULL,TOPIC_BUZZER_SET,NULL,NULL},
+  };
+  for(int i=0;i<6;i++){
+    JsonDocument doc; doc["name"]=ent[i].n; doc["uniq_id"]=ent[i].id;
+    doc["dev"]["ids"][0]="cyberclock_01"; doc["dev"]["name"]="Cyber Clock";
+    doc["dev"]["mf"]="DIY"; doc["dev"]["mdl"]="Smart Cyber Clock v10.1-ST7789";
+    if(ent[i].st)doc["stat_t"]=ent[i].st; if(ent[i].ct)doc["cmd_t"]=ent[i].ct;
+    if(ent[i].u)doc["unit_of_meas"]=ent[i].u; if(ent[i].dc)doc["dev_cla"]=ent[i].dc;
+    char t[128],b[512]; sprintf(t,"homeassistant/%s/%s/config",ent[i].c,ent[i].id);
+    serializeJson(doc,b); mqttClient.publish(t,b,true);
+  }
+
+  // ===== Backlight brightness — number entity (5-255) =====
+  {JsonDocument doc; doc["name"]="Cyber Clock Parlaklik"; doc["cmd_t"]=TOPIC_BL_SET;
+   doc["stat_t"]=TOPIC_BL_STATE; doc["min"]=5; doc["max"]=255;
+   doc["step"]=5; doc["icon"]="mdi:brightness-6";
+   doc["uniq_id"]="cyberclock_backlight"; doc["dev"]["ids"][0]="cyberclock_01";
+   doc["dev"]["name"]="Cyber Clock"; char b[512]; serializeJson(doc,b);
+   mqttClient.publish("homeassistant/number/cyberclock_backlight/config",b,true);}
+
+  // Remove old Backlight entities
+  mqttClient.publish("homeassistant/switch/cyberclock_led_switch/config", "", true);
+  mqttClient.publish("homeassistant/number/cyberclock_led_dimmer/config", "", true);
+  mqttClient.publish("homeassistant/select/cyberclock_ledmode/config", "", true);
+
+  // Volume number
+  {JsonDocument doc; doc["name"]="Cyber Clock Volume"; doc["cmd_t"]=TOPIC_VOL_SET;
+   doc["stat_t"]=TOPIC_VOL_STATE; doc["min"]=0; doc["max"]=100;
+   doc["unit_of_meas"]="%"; doc["icon"]="mdi:volume-high";
+   doc["uniq_id"]="cyberclock_vol"; doc["dev"]["ids"][0]="cyberclock_01";
+   doc["dev"]["name"]="Cyber Clock"; char b[512]; serializeJson(doc,b);
+   mqttClient.publish("homeassistant/number/cyberclock_vol/config",b,true);}
+
+  // Temp calibration number
+  {JsonDocument doc; doc["name"]="Cyber Clock Temp Offset"; doc["cmd_t"]=TOPIC_TCAL_SET;
+   doc["stat_t"]=TOPIC_TCAL_STATE; doc["min"]=-15; doc["max"]=15;
+   doc["step"]=0.5; doc["unit_of_meas"]="°C"; doc["icon"]="mdi:thermometer-alert";
+   doc["uniq_id"]="cyberclock_tcal"; doc["dev"]["ids"][0]="cyberclock_01";
+   doc["dev"]["name"]="Cyber Clock"; char b[512]; serializeJson(doc,b);
+   mqttClient.publish("homeassistant/number/cyberclock_tcal/config",b,true);}
+
+  // Hum calibration number
+  {JsonDocument doc; doc["name"]="Cyber Clock Hum Offset"; doc["cmd_t"]=TOPIC_HCAL_SET;
+   doc["stat_t"]=TOPIC_HCAL_STATE; doc["min"]=-20; doc["max"]=20;
+   doc["step"]=1; doc["unit_of_meas"]="%"; doc["icon"]="mdi:water-percent";
+   doc["uniq_id"]="cyberclock_hcal"; doc["dev"]["ids"][0]="cyberclock_01";
+   doc["dev"]["name"]="Cyber Clock"; char b[512]; serializeJson(doc,b);
+   mqttClient.publish("homeassistant/number/cyberclock_hcal/config",b,true);}
+
+  // Sleep mode switch
+  {JsonDocument doc; doc["name"]="Cyber Clock Uyku"; doc["cmd_t"]=TOPIC_SLEEP_SET;
+   doc["stat_t"]=TOPIC_SLEEP_STATE; doc["icon"]="mdi:sleep";
+   doc["uniq_id"]="cyberclock_sleep"; doc["dev"]["ids"][0]="cyberclock_01";
+   doc["dev"]["name"]="Cyber Clock"; char b[512]; serializeJson(doc,b);
+   mqttClient.publish("homeassistant/switch/cyberclock_sleep/config",b,true);}
+
+  // Auto-sleep enable/disable switch
+  {JsonDocument doc; doc["name"]="Cyber Clock Oto Uyku"; doc["cmd_t"]=TOPIC_AUTOSLEEP_SET;
+   doc["stat_t"]=TOPIC_AUTOSLEEP_STATE; doc["icon"]="mdi:sleep-off";
+   doc["uniq_id"]="cyberclock_autosleep"; doc["dev"]["ids"][0]="cyberclock_01";
+   doc["dev"]["name"]="Cyber Clock"; char b[512]; serializeJson(doc,b);
+   mqttClient.publish("homeassistant/switch/cyberclock_autosleep/config",b,true);}
+
+  // ===== Remove old entities that are no longer used =====
+
+  Serial.println("MQTT Discovery v7 published");
+}
+
+void connectMqtt() {
+  if(mqttClient.connected()) return;
+  unsigned long now=millis(); if(now-lastMqttReconnect<MQTT_RECONNECT_INTERVAL) return;
+  lastMqttReconnect=now;
+  if(mqttClient.connect(mqtt_client_id,mqtt_user,mqtt_password,TOPIC_STATUS,0,true,"offline")){
+    mqttClient.publish(TOPIC_STATUS,"online",true);
+    mqttClient.subscribe(TOPIC_ALARM_SET);
+    mqttClient.subscribe(TOPIC_BUZZER_SET);
+    mqttClient.subscribe(TOPIC_BL_SET);        // Backlight
+    mqttClient.subscribe(TOPIC_VOL_SET);
+    mqttClient.subscribe(TOPIC_TCAL_SET);
+    mqttClient.subscribe(TOPIC_HCAL_SET);
+    mqttClient.subscribe(TOPIC_SLEEP_SET);
+    mqttClient.subscribe(TOPIC_AUTOSLEEP_SET);
+    mqttClient.subscribe(TOPIC_HOME_CONFIG);
+    mqttClient.subscribe(TOPIC_HOME_STATE);
+    mqttClient.subscribe(TOPIC_WEATHER);
+    publishMqttDiscovery();
+    mqttClient.publish(TOPIC_ALARM_STATE,alarmEnabled?"ON":"OFF",true);
+    publishBacklightState();  // Backlight state
+    char vb[8]; sprintf(vb,"%d",volumeLevel); mqttClient.publish(TOPIC_VOL_STATE,vb,true);
+    char tb[8]; dtostrf(tempOffset,4,1,tb); mqttClient.publish(TOPIC_TCAL_STATE,tb,true);
+    char hb[8]; dtostrf(humOffset,4,1,hb); mqttClient.publish(TOPIC_HCAL_STATE,hb,true);
+    mqttClient.publish(TOPIC_SLEEP_STATE, screenSleeping?"ON":"OFF", true);
+    mqttClient.publish(TOPIC_AUTOSLEEP_STATE, sleepTimeoutMs>0?"ON":"OFF", true);
+  }
+}
+
+void publishSensorData() {
+  if(!mqttClient.connected()) return;
+  unsigned long now=millis(); if(now-lastMqttPublish<MQTT_PUBLISH_INTERVAL) return;
+  lastMqttPublish=now; char buf[16];
+  dtostrf(curTemp,4,1,buf); mqttClient.publish(TOPIC_TEMP,buf);
+  dtostrf(curHum,4,1,buf); mqttClient.publish(TOPIC_HUM,buf);
+  sprintf(buf,"%d",curTVOC); mqttClient.publish(TOPIC_TVOC,buf);
+  sprintf(buf,"%d",curECO2); mqttClient.publish(TOPIC_CO2,buf);
+}
+
+// ============================================================
+// Env Sensors
+// ============================================================
+void updateEnvSensors(bool force) {
+  unsigned long now=millis(); if(!force&&(now-lastEnvRead)<5000) return; lastEnvRead=now;
+  sensors_event_t hum,temp;
+  if(aht.getEvent(&hum,&temp)){
+    curTemp=temp.temperature + tempOffset;
+    curHum=constrain(hum.relative_humidity + humOffset, 0.0f, 100.0f);
+  }
+  // ENS160: measure and read
+  ens160.set_envdata(curTemp, curHum);
+  ensLastStatus = ens160.measure();
+  // Read values regardless of status (some library versions return 1 even with valid data)
+  uint16_t nT=ens160.getTVOC();
+  uint16_t nC=ens160.geteCO2();
+  if(nT!=0xFFFF && nT!=0 && nT<20000) curTVOC=nT;
+  if(nC!=0xFFFF && nC!=0 && nC>=400 && nC<20000) curECO2=nC;
+  // If stuck in status!=0, periodically re-init ENS160
+  if(ensLastStatus != 0) {
+    static unsigned long lastEnsRetry = 0;
+    if(millis() - lastEnsRetry > 15000) {
+      lastEnsRetry = millis();
+      Wire.end(); delay(50); Wire.begin(SDA_PIN,SCL_PIN); delay(50);
+      ens160.begin();
+      delay(50);
+      ens160.setMode(ENS160_OPMODE_STD);
+      delay(50);
+      // Re-init AHT too since we reset Wire
+      aht.begin();
+    }
+  }
+}
+
+// ============================================================
+// Clock UI
+// ============================================================
+// ====== Clock UI Layout (320x240) ======
+// Saat (y=15), Nem+Sıcaklık (y=78), Tarih (y=140), Hava durumu (y=185)
+const int GRID_L=8,GRID_R=312,GRID_TOP=78,GRID_MID=130;
+const int GRID_MID_X=(GRID_L+GRID_R)/2;
+const int TOP_LABEL_Y=GRID_TOP+4,TOP_VALUE_Y=GRID_TOP+20;
+const int DATE_Y=142;
+const int WEATHER_Y=185;
+
+void printCenteredText(const String &t,int x0,int x1,int y,uint16_t c,uint16_t bg,uint8_t s=1){
+  int16_t bx,by;uint16_t w,h;tft.setTextSize(s);tft.getTextBounds(t,0,0,&bx,&by,&w,&h);
+  tft.setTextColor(c,bg);tft.setCursor(x0+((x1-x0)-(int)w)/2,y);tft.print(t);}
+
+uint16_t colorForCO2(uint16_t e){if(e<=800)return AQ_BAR_GREEN;if(e<=1200)return AQ_BAR_YELLOW;if(e<=1600)return AQ_BAR_ORANGE;return AQ_BAR_RED;}
+
+// Turkish day/month names
+const char* turkGun[] = {"Pazar","Pazartesi","Sali","Carsamba","Persembe","Cuma","Cumartesi"};
+const char* turkAy[] = {"","Ocak","Subat","Mart","Nisan","Mayis","Haziran","Temmuz","Agustos","Eylul","Ekim","Kasim","Aralik"};
+
+void drawDate() {
+  time_t now; time(&now);
+  struct tm ti; localtime_r(&now, &ti);
+  char buf[40];
+  sprintf(buf, "%d %s %d %s", ti.tm_mday, turkAy[ti.tm_mon+1], ti.tm_year+1900, turkGun[ti.tm_wday]);
+  tft.fillRect(GRID_L, DATE_Y-2, GRID_R-GRID_L, 28, CYBER_BG);
+  printCenteredText(String(buf), GRID_L, GRID_R, DATE_Y, CLR_DATE, CYBER_BG, 2);
+}
+
+// Translate HA weather condition to Turkish
+const char* translateWeather(const char* cond) {
+  if (strcmp(cond, "sunny") == 0) return "Gunesli";
+  if (strcmp(cond, "clear-night") == 0) return "Acik";
+  if (strcmp(cond, "partlycloudy") == 0) return "Parcali Bulutlu";
+  if (strcmp(cond, "cloudy") == 0) return "Bulutlu";
+  if (strcmp(cond, "rainy") == 0) return "Yagmurlu";
+  if (strcmp(cond, "pouring") == 0) return "Saganak";
+  if (strcmp(cond, "snowy") == 0) return "Karli";
+  if (strcmp(cond, "snowy-rainy") == 0) return "Karla Karisik";
+  if (strcmp(cond, "fog") == 0) return "Sisli";
+  if (strcmp(cond, "hail") == 0) return "Dolu";
+  if (strcmp(cond, "lightning") == 0) return "Firtina";
+  if (strcmp(cond, "lightning-rainy") == 0) return "Gokgurultusu";
+  if (strcmp(cond, "windy") == 0) return "Ruzgarli";
+  if (strcmp(cond, "windy-variant") == 0) return "Ruzgarli";
+  if (strcmp(cond, "exceptional") == 0) return "Olagandisi";
+  return cond;
+}
+
+void drawWeather() {
+  tft.fillRect(GRID_L, WEATHER_Y-2, GRID_R-GRID_L, 50, CYBER_BG);
+  if (!weatherValid) {
+    printCenteredText("Hava durumu bekleniyor...", GRID_L, GRID_R, WEATHER_Y+8, CYBER_GREY, CYBER_BG, 1);
+    return;
+  }
+  // Weather condition + temperature (large)
+  char buf[64];
+  sprintf(buf, "%s  %.1f'C", translateWeather(weatherCond), weatherTemp);
+  printCenteredText(String(buf), GRID_L, GRID_R, WEATHER_Y, CLR_WEATHER, CYBER_BG, 3);
+  // Humidity + Wind (smaller, below)
+  sprintf(buf, "Nem: %d%%   Ruzgar: %.1f km/h", weatherHum, weatherWind);
+  printCenteredText(String(buf), GRID_L, GRID_R, WEATHER_Y+30, CLR_WDETAIL, CYBER_BG, 1);
+}
+
+void initClockStaticUI() {
+  tft.fillScreen(CYBER_BG);
+
+  // MQTT indicator (top right, subtle)
+  if(mqttClient.connected()){
+    tft.setTextSize(1);tft.setTextColor(CYBER_GREEN);
+    tft.setCursor(280,4);tft.print("MQTT");
+  }
+
+  // Grid lines (soft grey)
+  tft.drawFastHLine(GRID_L,GRID_TOP,GRID_R-GRID_L,CYBER_GREY);
+  tft.drawFastHLine(GRID_L,GRID_MID,GRID_R-GRID_L,CYBER_GREY);
+  tft.drawFastVLine(GRID_MID_X,GRID_TOP,GRID_MID-GRID_TOP,CYBER_GREY);
+
+  // Labels (textSize 1, soft grey)
+  printCenteredText("Nem",GRID_L,GRID_MID_X,TOP_LABEL_Y,CYBER_GREY,CYBER_BG,1);
+  printCenteredText("Sicaklik",GRID_MID_X,GRID_R,TOP_LABEL_Y,CYBER_GREY,CYBER_BG,1);
+
+  // Date separator
+  tft.drawFastHLine(GRID_L, WEATHER_Y-8, GRID_R-GRID_L, CYBER_GREY);
+
+  drawAlarmIcon();
+  drawDate();
+  drawWeather();
+}
+
+void drawClockTime(String hS,String mS,String sS){
+  String c=hS+":"+mS+":"+sS; if(c==prevTimeStr)return; prevTimeStr=c;
+  int16_t x1,y1;uint16_t w,h; tft.setTextSize(6);tft.getTextBounds(c,0,0,&x1,&y1,&w,&h);
+  tft.setTextColor(CLR_CLOCK,CYBER_BG);tft.setCursor((320-w)/2,15);tft.print(c);}
+
+void drawCO2Value(uint16_t e,uint16_t c){} // ENS160 disabled — stub
+
+void drawEnvDynamic(float t,float h,uint16_t tv,uint16_t e){
+  char b[16];
+  // Clear value areas before redraw (prevent text ghosting)
+  int valH = 28;
+  tft.fillRect(GRID_L+1, TOP_VALUE_Y-2, GRID_MID_X-GRID_L-2, valH, CYBER_BG);
+  tft.fillRect(GRID_MID_X+1, TOP_VALUE_Y-2, GRID_R-GRID_MID_X-2, valH, CYBER_BG);
+
+  sprintf(b,"%.0f%%",h);printCenteredText(String(b),GRID_L,GRID_MID_X,TOP_VALUE_Y,CLR_HUM,CYBER_BG,3);
+  sprintf(b,"%.1fC",t);printCenteredText(String(b),GRID_MID_X,GRID_R,TOP_VALUE_Y,CLR_TEMP,CYBER_BG,3);
+
+  // Update date every minute
+  static int lastMin = -1;
+  time_t now; time(&now);
+  struct tm ti; localtime_r(&now, &ti);
+  if(ti.tm_min != lastMin){ lastMin = ti.tm_min; drawDate(); }
+}
+
+// ============================================================
+// Menu
+// ============================================================
+// Scrolling menu: shows MENU_VISIBLE items at a time
+#define MENU_VISIBLE 7
+int menuScrollOffset = 0;
+
+void drawMenu() {
+  tft.fillScreen(CYBER_BG); tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT);
+  tft.setTextSize(2);tft.setCursor(20,8); tft.print("MOD SEC");
+  if(mqttClient.connected()){tft.setTextColor(CYBER_GREEN);tft.setCursor(220,10);tft.print("[MQTT]");}
+  const char* items[MENU_ITEMS]={"Monitor","Pomodoro","Alarm","Oyunlar","Parlaklik","Ev","Ayarlar","Uyku"};
+  tft.setTextSize(2);
+  
+  // Keep selected item in visible window
+  if(menuIndex < menuScrollOffset) menuScrollOffset = menuIndex;
+  if(menuIndex >= menuScrollOffset + MENU_VISIBLE) menuScrollOffset = menuIndex - MENU_VISIBLE + 1;
+  if(menuScrollOffset < 0) menuScrollOffset = 0;
+  
+  for(int vi=0; vi<MENU_VISIBLE && (menuScrollOffset+vi)<MENU_ITEMS; vi++){
+    int i = menuScrollOffset + vi;
+    int y = 35 + vi * 28;
+    if(i==menuIndex){tft.fillRoundRect(10,y-4,300,24,4,CYBER_ACCENT);tft.setTextColor(CYBER_BG);}
+    else{tft.fillRoundRect(10,y-4,300,24,4,0x18E3);tft.setTextColor(ST77XX_WHITE);}
+    tft.setCursor(20,y);tft.print(items[i]);
+    if(i==3 || i==5){
+      if(i==menuIndex) tft.setTextColor(CYBER_BG);
+      else tft.setTextColor(CYBER_DARK);
+      tft.setCursor(145, y); tft.print(">");
+    }
+  }
+  // Scroll indicators
+  if(menuScrollOffset > 0){tft.setTextColor(CYBER_DARK);tft.setCursor(155,25);tft.print("^");}
+  if(menuScrollOffset + MENU_VISIBLE < MENU_ITEMS){tft.setTextColor(CYBER_DARK);tft.setCursor(155,35+MENU_VISIBLE*28);tft.print("v");}
+  drawAlarmIcon();
+}
+
+// ============================================================
+// Games Sub-Menu
+// ============================================================
+#define GAMES_VISIBLE 6
+int gamesScrollOffset = 0;
+
+void drawGamesMenu() {
+  tft.fillScreen(CYBER_BG); tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT);
+  tft.setTextSize(2);tft.setCursor(20,8); tft.print("OYUNLAR");
+  tft.setTextColor(CYBER_DARK);tft.setTextSize(1); tft.setCursor(240,14); tft.print("K0:geri");
+  
+  if(gamesMenuIndex < gamesScrollOffset) gamesScrollOffset = gamesMenuIndex;
+  if(gamesMenuIndex >= gamesScrollOffset + GAMES_VISIBLE) gamesScrollOffset = gamesMenuIndex - GAMES_VISIBLE + 1;
+  if(gamesScrollOffset < 0) gamesScrollOffset = 0;
+  
+  for(int vi=0; vi<GAMES_VISIBLE && (gamesScrollOffset+vi)<GAMES_COUNT; vi++){
+    int i = gamesScrollOffset + vi;
+    int y = 40 + vi * 30;
+    if(i==gamesMenuIndex){tft.fillRoundRect(10,y-4,300,26,4,CYBER_ACCENT);tft.setTextColor(CYBER_BG);}
+    else{tft.fillRoundRect(10,y-4,300,26,4,0x18E3);tft.setTextColor(ST77XX_WHITE);}
+    tft.setTextSize(2);tft.setCursor(20,y); tft.print(gameNames[i]);
+  }
+  if(gamesScrollOffset > 0){tft.setTextColor(CYBER_DARK);tft.setCursor(155,30);tft.print("^");}
+  if(gamesScrollOffset + GAMES_VISIBLE < GAMES_COUNT){tft.setTextColor(CYBER_DARK);tft.setCursor(155,40+GAMES_VISIBLE*30);tft.print("v");}
+  drawAlarmIcon();
+}
+
+// ============================================================
+// Pomodoro (free timer)
+// ============================================================
+void drawPomodoroScreen(bool full) {
+  if (full) {
+    tft.fillScreen(CYBER_BG); tft.setTextSize(2); tft.setCursor(16,10);
+    tft.setTextColor(CYBER_LIGHT); tft.print("POMODORO"); drawAlarmIcon();
+  }
+
+  if (pomoState == POMO_SELECT) {
+    tft.fillRect(0,40,320,200,CYBER_BG);
+
+    tft.setTextSize(2);tft.setTextColor(CYBER_GREY);
+    tft.setCursor(80,48); tft.print("Zamani ayarla");
+
+    char mBuf[4], sBuf[4];
+    sprintf(mBuf, "%02d", pomoMinutes);
+    sprintf(sBuf, "%02d", pomoSeconds);
+
+    tft.setTextSize(6);
+    int16_t x1,y1; uint16_t w,h;
+    String disp = String(mBuf) + ":" + String(sBuf);
+    tft.getTextBounds(disp,0,0,&x1,&y1,&w,&h);
+    int x = (320-w)/2;
+    tft.setCursor(x, 85);
+    tft.setTextColor(pomoField==0 ? CYBER_ACCENT : ST77XX_WHITE, CYBER_BG);
+    tft.print(mBuf);
+    tft.setTextColor(ST77XX_WHITE, CYBER_BG); tft.print(":");
+    tft.setTextColor(pomoField==1 ? CYBER_ACCENT : ST77XX_WHITE, CYBER_BG);
+    tft.print(sBuf);
+
+    tft.setTextSize(1);
+    tft.setTextColor(CYBER_GREY);
+    tft.setCursor(x + 5, 140); tft.print("dakika");
+    tft.setCursor(x + w - 40, 140); tft.print("saniye");
+
+    tft.setTextSize(1);
+    tft.setTextColor(CYBER_GREEN);
+    tft.setCursor(60, 170); tft.print("Cevir: deger degistir");
+    tft.setCursor(60, 185); tft.print("Bas: dk <-> sn");
+    tft.setCursor(60, 200); tft.print("Uzun bas: BASLAT");
+    tft.setTextColor(CYBER_DARK);
+    tft.setCursor(60, 220); tft.print("K0: geri");
+  } else {
+    unsigned long dMs = (pomoMinutes*60UL + pomoSeconds) * 1000UL;
+    unsigned long elapsed = 0;
+    if(pomoState==POMO_RUNNING) elapsed=millis()-pomoStartMillis;
+    else if(pomoState==POMO_PAUSED) elapsed=pomoPausedMillis-pomoStartMillis;
+    else if(pomoState==POMO_DONE) elapsed=dMs;
+    if(elapsed>dMs) elapsed=dMs;
+
+    float progress = (dMs>0) ? (float)elapsed/dMs : 0;
+    int cx=160,cy=120,rO=95,rI=75;
+    float startD=-225,endD=45,span=endD-startD;
+    for(float d=startD;d<=endD;d+=6.0f){
+      float frac=(d-startD)/span;
+      uint16_t col;
+      if(frac<=progress){if(frac<0.33f)col=AQ_BAR_GREEN;else if(frac<0.66f)col=AQ_BAR_YELLOW;else if(frac<0.85f)col=AQ_BAR_ORANGE;else col=AQ_BAR_RED;}
+      else col=CYBER_DARK;
+      float rad=d*PI/180.0f;
+      tft.drawLine(cx+cos(rad)*rI,cy+sin(rad)*rI,cx+cos(rad)*rO,cy+sin(rad)*rO,col);
+    }
+
+    tft.fillCircle(cx,cy,65,CYBER_BG);
+    unsigned long rem=dMs-elapsed;
+    int remMin=rem/60000UL, remSec=(rem/1000UL)%60;
+    char buf[8]; sprintf(buf,"%02d:%02d",remMin,remSec);
+    int16_t x1,y1; uint16_t w,h;
+    tft.setTextSize(5);tft.getTextBounds(buf,0,0,&x1,&y1,&w,&h);
+    tft.setCursor(cx-w/2,cy-16);tft.setTextColor(ST77XX_WHITE,CYBER_BG);tft.print(buf);
+
+    // Status text
+    tft.fillRect(0,222,320,18,CYBER_BG);
+    tft.setTextSize(1);
+    if(pomoState==POMO_PAUSED) {
+      tft.setTextColor(AQ_BAR_YELLOW,CYBER_BG);
+      printCenteredText("DURDU  |  Bas: devam  |  K0: iptal", 0, 320, 226, AQ_BAR_YELLOW, CYBER_BG, 1);
+    } else if(pomoState==POMO_DONE) {
+      printCenteredText("BITTI!  |  Bas: yeni  |  K0: menu", 0, 320, 226, CYBER_GREEN, CYBER_BG, 1);
+    } else {
+      printCenteredText("CALISIYOR  |  Bas: durdur", 0, 320, 226, CYBER_ACCENT, CYBER_BG, 1);
+    }
+  }
+}
+
+// ============================================================
+// Alarm
+// ============================================================
+void drawAlarmScreen(bool full) {
+  if(full){tft.fillScreen(CYBER_BG);tft.setTextSize(2);tft.setCursor(16,10);
+    tft.setTextColor(CYBER_LIGHT);tft.print("ALARM");drawAlarmIcon();}
+  char hB[3],mB[3];sprintf(hB,"%02d",alarmHour);sprintf(mB,"%02d",alarmMinute);
+  tft.setTextSize(6);String disp=String(hB)+":"+String(mB);
+  int16_t x1,y1;uint16_t w,h;tft.getTextBounds(disp,0,0,&x1,&y1,&w,&h);
+  int x=(320-w)/2;tft.setCursor(x,60);
+  tft.setTextColor(alarmSelectedField==0?CYBER_LIGHT:ST77XX_WHITE,CYBER_BG);tft.print(hB);
+  tft.setTextColor(ST77XX_WHITE,CYBER_BG);tft.print(":");
+  tft.setTextColor(alarmSelectedField==1?CYBER_LIGHT:ST77XX_WHITE,CYBER_BG);tft.print(mB);
+  tft.setTextSize(2);tft.fillRect(40,140,240,36,CYBER_BG);
+  tft.setCursor(60,148);tft.setTextColor(ST77XX_WHITE,CYBER_BG);tft.print("Alarm:");
+  tft.setCursor(160,148);
+  uint16_t ec=alarmSelectedField==2?CYBER_LIGHT:(alarmEnabled?CYBER_GREEN:ST77XX_RED);
+  tft.setTextColor(ec,CYBER_BG);tft.print(alarmEnabled?"ON ":"OFF");
+}
+
+void drawAlarmRingingScreen(){
+  tft.fillScreen(ST77XX_RED);tft.setTextSize(4);tft.setTextColor(ST77XX_WHITE,ST77XX_RED);
+  tft.setCursor(70,60);tft.print("ALARM!");
+  tft.setTextSize(2);tft.setCursor(40,130);tft.print("Herhangi tusa basin");
+}
+
+void checkAlarmTrigger(){
+  if(!alarmEnabled||alarmRinging) return;
+  struct tm ti; if(!getLocalTime(&ti)) return;
+  if(ti.tm_hour==alarmHour&&ti.tm_min==alarmMinute&&ti.tm_sec==0){
+    alarmRinging=true;lastAlarmDayTriggered=ti.tm_mday;
+    if(currentMode==MODE_TETRIS) { tetInited=false; }
+    if(currentMode==MODE_BREAKOUT) { brkInited=false; }
+    if(currentMode==MODE_FLAPPY) { flpInited=false; }
+    if(currentMode==MODE_PONG) { pngInited=false; }
+    if(currentMode==MODE_2048) { g48Inited=false; }
+    currentMode=MODE_ALARM;drawAlarmRingingScreen();
+    playAlarmByIndex(selectedAlarm,true);
+  }
+}
+
+void updateAlertStateAndLED(){
+  if(alarmRinging)currentAlertLevel=ALERT_ALARM;
+  else if(curECO2>1600)currentAlertLevel=ALERT_CO2;
+  else currentAlertLevel=ALERT_NONE;
+
+  unsigned long now=millis();
+
+  if(currentAlertLevel==ALERT_ALARM){
+    alertLedActive=true;
+    if(now-lastAlertLedMs>120){
+      lastAlertLedMs=now;
+      alertLedState=!alertLedState;  // Alert: buzzer only (no LED)
+    }
+  }
+  else if(currentAlertLevel==ALERT_CO2){
+    alertLedActive=true;
+    
+    // Start CO2 alarm once (melody + screen)
+    if(!co2AlertTriggered){
+      co2AlertTriggered=true;
+      if(currentMode==MODE_TETRIS) { tetInited=false; }
+      if(currentMode==MODE_BREAKOUT) { brkInited=false; }
+      if(currentMode==MODE_FLAPPY) { flpInited=false; }
+      if(currentMode==MODE_PONG) { pngInited=false; }
+      if(currentMode==MODE_2048) { g48Inited=false; }
+      startMelody(co2AlarmMelody, co2AlarmDurations, CO2_ALARM_MELODY_LEN, true);
+      // Show CO2 alert screen
+      tft.fillScreen(AQ_BAR_RED);
+      tft.setTextSize(3); tft.setTextColor(ST77XX_WHITE, AQ_BAR_RED);
+      tft.setCursor(30,30); tft.print("CO2 ALARM!");
+      tft.setTextSize(5); tft.setCursor(40,80);
+      tft.printf("%dppm", curECO2);
+      tft.setTextSize(2); tft.setCursor(20,150);
+      tft.print("Hava kalitesi cok kotu!");
+      tft.setCursor(30,180); tft.print("Pencereyi acin!");
+      tft.setCursor(30,210); tft.print("Tusa basin");
+    }
+    
+    // Blink LED
+    if(now-lastCo2BlinkMs>350){
+      lastCo2BlinkMs=now;
+      co2BlinkOn=!co2BlinkOn;
+      alertLedState=co2BlinkOn;  // Alert: buzzer only
+    }
+  }
+  else {
+    // CO2 dropped below threshold — reset alert
+    if(co2AlertTriggered){
+      co2AlertTriggered=false;
+      stopMelody();
+    }
+    if(alertLedActive){
+      alertLedActive=false;
+      updateBacklight();
+    }
+  }
+}
+
+void drawCo2AlertScreen(){
+  tft.fillScreen(AQ_BAR_RED);
+  tft.setTextSize(3); tft.setTextColor(ST77XX_WHITE, AQ_BAR_RED);
+  tft.setCursor(30,30); tft.print("CO2 ALARM!");
+  tft.setTextSize(5); tft.setCursor(40,80);
+  tft.printf("%dppm", curECO2);
+  tft.setTextSize(2); tft.setCursor(20,150);
+  tft.print("Hava kalitesi cok kotu!");
+  tft.setCursor(30,180); tft.print("Pencereyi acin!");
+  tft.setCursor(30,210); tft.print("Tusa basin");
+}
+
+void dismissAlert(){
+  if(currentAlertLevel==ALERT_ALARM){
+    alarmRinging=false;
+    stopMelody();
+    mqttClient.publish(TOPIC_ALARM_STATE,"OFF");
+  }
+  if(co2AlertTriggered){
+    co2AlertTriggered=false;
+    stopMelody();
+  }
+  alertLedActive=false;
+  updateBacklight();
+}
+
+// ============================================================
+// Snake Game
+// ============================================================
+void snkSpawnFood() {
+  bool valid;
+  do {
+    valid = true;
+    foodX = random(SNK_COLS);
+    foodY = random(SNK_ROWS);
+    for (int i = 0; i < snakeLen; i++) {
+      if (snakeX[i] == foodX && snakeY[i] == foodY) { valid = false; break; }
+    }
+  } while (!valid);
+}
+
+void snkDrawBlock(int col, int row, uint16_t color) {
+  tft.fillRect(SNK_X + col * SNK_BLOCK, SNK_Y + row * SNK_BLOCK, SNK_BLOCK-1, SNK_BLOCK-1, color);
+}
+
+void snkDrawScore() {
+  tft.fillRect(0, 0, 80, 12, CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_GREEN, CYBER_BG);
+  tft.setCursor(4, 2); tft.printf("Skor:%d", snkScore);
+}
+
+void initSnake() {
+  snkInited = true; snkGameOver = false;
+  snkScore = 0; snakeLen = 3; snakeDir = 0;
+  snkMoveInterval = 200;
+  snkDirQueueLen = 0;  // Clear direction queue
+  
+  for (int i = 0; i < snakeLen; i++) {
+    snakeX[i] = SNK_COLS/2 - i;
+    snakeY[i] = SNK_ROWS/2;
+  }
+  snkSpawnFood();
+  
+  tft.fillScreen(CYBER_BG);
+  tft.setTextSize(1); tft.setTextColor(CYBER_LIGHT, CYBER_BG);
+  tft.setCursor(80, 2); tft.print("SNAKE");
+  tft.drawRect(SNK_X-1, SNK_Y-1, SNK_COLS*SNK_BLOCK+2, SNK_ROWS*SNK_BLOCK+2, ST77XX_WHITE);
+  snkDrawScore();
+  
+  for (int i = 0; i < snakeLen; i++) {
+    snkDrawBlock(snakeX[i], snakeY[i], i==0 ? CYBER_ACCENT : CYBER_GREEN);
+  }
+  snkDrawBlock(foodX, foodY, AQ_BAR_RED);
+}
+
+void updateSnake(int enc, bool encP, bool back) {
+  if (back) { snkInited=false; currentMode=MODE_GAMES_MENU; drawGamesMenu(); return; }
+  
+  if (snkGameOver) {
+    tft.setTextSize(2); tft.setTextColor(ST77XX_RED, CYBER_BG);
+    tft.setCursor(25, 50); tft.print("GAME OVER");
+    tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, CYBER_BG);
+    tft.setCursor(35, 75); tft.printf("Skor: %d", snkScore);
+    if (encP || enc != 0) initSnake();
+    return;
+  }
+  
+  // Queue direction changes (max 2 buffered) — prevents fast triple-turn self-kill
+  if (enc != 0 && snkDirQueueLen < 2) {
+    // Calculate new direction based on last queued (or current) direction
+    int baseDir = (snkDirQueueLen > 0) ? snkDirQueue[snkDirQueueLen-1] : snakeDir;
+    int newDir;
+    if (enc > 0) newDir = (baseDir + 1) % 4;  // clockwise = turn right
+    else newDir = (baseDir + 3) % 4;           // counter-clockwise = turn left
+    
+    // Allow all turns including 180° — queue limit (max 2) prevents 270° crash
+    snkDirQueue[snkDirQueueLen++] = newDir;
+  }
+  
+  unsigned long interval = encP ? 50 : snkMoveInterval;
+  
+  unsigned long now = millis();
+  if (now - snkLastMove < interval) return;
+  snkLastMove = now;
+  
+  // Dequeue one direction per movement step
+  if (snkDirQueueLen > 0) {
+    snakeDir = snkDirQueue[0];
+    // Shift queue
+    for (int i = 1; i < snkDirQueueLen; i++) snkDirQueue[i-1] = snkDirQueue[i];
+    snkDirQueueLen--;
+  }
+  
+  int newX = snakeX[0], newY = snakeY[0];
+  switch (snakeDir) {
+    case 0: newX++; break;
+    case 1: newY++; break;
+    case 2: newX--; break;
+    case 3: newY--; break;
+  }
+  
+  if (newX < 0 || newX >= SNK_COLS || newY < 0 || newY >= SNK_ROWS) {
+    snkGameOver = true; vTone(BUZZ_PIN, 200, 500); return;
+  }
+  
+  for (int i = 0; i < snakeLen; i++) {
+    if (snakeX[i] == newX && snakeY[i] == newY) {
+      snkGameOver = true; vTone(BUZZ_PIN, 200, 500); return;
+    }
+  }
+  
+  bool ate = (newX == foodX && newY == foodY);
+  
+  if (!ate) {
+    snkDrawBlock(snakeX[snakeLen-1], snakeY[snakeLen-1], 0);
+    for (int i = snakeLen-1; i > 0; i--) {
+      snakeX[i] = snakeX[i-1]; snakeY[i] = snakeY[i-1];
+    }
+  } else {
+    snakeLen++;
+    for (int i = snakeLen-1; i > 0; i--) {
+      snakeX[i] = snakeX[i-1]; snakeY[i] = snakeY[i-1];
+    }
+    snkScore += 10;
+    snkDrawScore();
+    vTone(BUZZ_PIN, 1500, 30);
+    if (snkMoveInterval > 80) snkMoveInterval -= 5;
+    snkSpawnFood();
+    snkDrawBlock(foodX, foodY, AQ_BAR_RED);
+  }
+  
+  snakeX[0] = newX; snakeY[0] = newY;
+  snkDrawBlock(snakeX[0], snakeY[0], CYBER_ACCENT);
+  if (snakeLen > 1) snkDrawBlock(snakeX[1], snakeY[1], CYBER_GREEN);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200); delay(1500);
+  loadSettings();  // Load saved calibration, volume, sleep timeout from NVS
+  Serial.printf("Loaded: tempOff=%.1f humOff=%.1f vol=%d sleep=%lums\n", tempOffset, humOffset, volumeLevel, sleepTimeoutMs);
+  pinMode(ENC_A_PIN,INPUT_PULLUP); pinMode(ENC_B_PIN,INPUT_PULLUP);
+  pinMode(ENC_BTN_PIN,INPUT_PULLUP); pinMode(KEY0_PIN,INPUT_PULLUP);
+  pinMode(BL_PIN,OUTPUT); pinMode(BUZZ_PIN,OUTPUT);
+  analogWrite(BL_PIN,0);
+  Wire.begin(SDA_PIN,SCL_PIN);
+  SPI.begin(TFT_SCLK,-1,TFT_MOSI,TFT_CS);
+  tft.init(240, 320); tft.setRotation(3); tft.invertDisplay(false); tft.fillScreen(CYBER_BG);
+  connectWiFiAndSyncTime();
+  Wire.end(); delay(200); Wire.begin(SDA_PIN,SCL_PIN); delay(200);
+  
+  // AHT21 init
+  if(!aht.begin()) Serial.println("AHT21 fail"); else Serial.println("AHT21 OK");
+  
+  // ENS160 init — needs careful sequence after WiFi
+  delay(100);
+  bool ensOk = ens160.begin();
+  if(!ensOk) {
+    Serial.println("ENS160 begin fail, retrying...");
+    delay(500);
+    Wire.end(); delay(100); Wire.begin(SDA_PIN,SCL_PIN); delay(100);
+    ensOk = ens160.begin();
+  }
+  if(ensOk) {
+    delay(100);
+    ens160.setMode(ENS160_OPMODE_STD);
+    delay(100);
+    // Do a few dummy reads to flush stale data
+    for(int i=0; i<3; i++) { ens160.measure(); delay(100); }
+    Serial.println("ENS160 OK");
+  } else {
+    Serial.println("ENS160 FAIL");
+  }
+  updateEnvSensors(true);
+  initClockStaticUI(); prevTimeStr="";
+  drawClockTime(getTimeStr('H'),getTimeStr('M'),getTimeStr('S'));
+  drawEnvDynamic(curTemp,curHum,curTVOC,curECO2);
+  randomSeed(millis() ^ (uint32_t)curTemp);
+  pinMode(KEY0_PIN, INPUT_PULLUP);
+  lastActivityMs = millis();  // Initialize auto-sleep timer
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+  static unsigned long lastWifiCheck=0;
+  bool inGame = (currentMode==MODE_TETRIS || currentMode==MODE_GAME || currentMode==MODE_BREAKOUT || currentMode==MODE_FLAPPY || currentMode==MODE_PONG || currentMode==MODE_2048);
+
+  // WiFi/MQTT always runs (even in sleep — sensors + HA control)
+  if(!inGame || screenSleeping){
+    if(millis()-lastWifiCheck>30000){lastWifiCheck=millis();
+      if(WiFi.status()!=WL_CONNECTED){WiFi.begin(ssid,password);}}  // Non-blocking reconnect
+    if(WiFi.status()==WL_CONNECTED){if(!mqttClient.connected())connectMqtt();mqttClient.loop();publishSensorData();}
+  } else {
+    if(WiFi.status()==WL_CONNECTED) mqttClient.loop();
+  }
+
+  updateBacklight(); updateMelody(); vToneUpdate();
+
+  int encStep=readEncoderStep();
+  bool encPressed=checkButtonPressed(ENC_BTN_PIN,lastEncBtn);
+  bool k0Pressed=checkButtonPressed(KEY0_PIN,lastKey0);
+
+  // Track any user activity for auto-sleep timer
+  bool anyActivity = (encStep != 0 || encPressed || k0Pressed);
+  if(anyActivity) {
+    resetActivityTimer();
+    if(screenDimmed) exitDim();  // Any activity restores brightness
+  }
+
+  checkAlarmTrigger(); updateAlertStateAndLED();
+
+  // Always read sensors (not just on clock screen)
+  updateEnvSensors();
+
+  // === SLEEP MODE HANDLING ===
+  if(screenSleeping){
+    // Keep reading sensors and publishing to HA even while sleeping
+    updateEnvSensors();
+    
+    // Wake on alarm
+    if(alarmRinging){
+      wakeUp();
+      currentMode=MODE_ALARM;
+      drawAlarmRingingScreen();
+      return;
+    }
+    // Wake on CO2 alert too
+    if(currentAlertLevel==ALERT_CO2){
+      wakeUp();
+      return;
+    }
+    // Wake on any button/encoder press (but NOT encoder rotation to avoid accidental wake)
+    if(encPressed || k0Pressed){
+      wakeUp();
+      return;  // Don't process the button press further
+    }
+    // While sleeping, still read encoder but ignore it
+    return;  // Skip all UI updates
+  }
+
+  // === K0 LONG PRESS DETECTION (sleep from any screen) ===
+  bool k0Cur = digitalRead(KEY0_PIN);
+  if(k0Cur == LOW){
+    if(k0HoldStart == 0) k0HoldStart = millis();
+    if(!k0Held && millis() - k0HoldStart > 1000){
+      // Long press detected — enter sleep
+      k0Held = true;
+      enterSleep();
+      return;
+    }
+  } else {
+    k0HoldStart = 0;
+    k0Held = false;
+  }
+  // Suppress k0Pressed if we're in a long press hold (avoid triggering menu exit)
+  if(k0HoldStart > 0 && millis() - k0HoldStart > 200) k0Pressed = false;
+
+  // === AUTO-DIM & AUTO-SLEEP TIMER ===
+  if(sleepTimeoutMs > 0 && currentMode != MODE_SLEEP && !screenSleeping){
+    unsigned long idle = millis() - lastActivityMs;
+    // Phase 1: Dim after timeout (works on ALL screens including games)
+    if(idle > sleepTimeoutMs && !screenDimmed){
+      enterDim();
+    }
+    // Phase 2: Full sleep 2 min after dimming
+    if(screenDimmed && millis() - dimStartMs > DIM_TO_SLEEP_MS){
+      enterSleep();
+      return;
+    }
+  }
+
+  // === CO2 ALERT DISMISS ===
+  // When CO2 alert is active, any button dismisses it and restores previous screen
+  if(co2AlertTriggered && (encPressed || k0Pressed)){
+    dismissAlert();
+    // Redraw current screen
+    switch(currentMode){
+      case MODE_CLOCK: initClockStaticUI(); prevTimeStr="";
+        drawClockTime(getTimeStr('H'),getTimeStr('M'),getTimeStr('S'));
+        drawEnvDynamic(curTemp,curHum,curTVOC,curECO2); break;
+      case MODE_MENU: drawMenu(); break;
+      default: drawMenu(); currentMode=MODE_MENU; break;
+    }
+    return;
+  }
+
+  switch(currentMode){
+    case MODE_MENU:
+      if(encStep!=0){menuIndex+=encStep;if(menuIndex<0)menuIndex=MENU_ITEMS-1;if(menuIndex>=MENU_ITEMS)menuIndex=0;drawMenu();}
+      if(encPressed){
+        switch(menuIndex){
+          case 0:currentMode=MODE_CLOCK;initClockStaticUI();prevTimeStr="";updateEnvSensors(true);
+            drawClockTime(getTimeStr('H'),getTimeStr('M'),getTimeStr('S'));
+            drawEnvDynamic(curTemp,curHum,curTVOC,curECO2);break;
+          case 1:currentMode=MODE_POMODORO;pomoState=POMO_SELECT;pomoField=0;prevPomoForce=true;drawPomodoroScreen(true);break;
+          case 2:currentMode=MODE_ALARM;alarmSelectedField=0;drawAlarmScreen(true);break;
+          case 3:currentMode=MODE_GAMES_MENU;gamesMenuIndex=0;drawGamesMenu();break;  // Oyunlar
+          case 4:currentMode=MODE_BRIGHT;drawBrightnessScreen(true);break;
+          case 5:currentMode=MODE_HOME;homeInited=false;break;  // Ev
+          case 6:currentMode=MODE_SETTINGS;settingsField=0;drawSettingsScreen(true);break;
+          case 7:enterSleep();break;
+        }
+      }
+      break;
+
+    // === GAMES SUB-MENU ===
+    case MODE_GAMES_MENU:
+      if(encStep!=0){gamesMenuIndex+=encStep;if(gamesMenuIndex<0)gamesMenuIndex=GAMES_COUNT-1;if(gamesMenuIndex>=GAMES_COUNT)gamesMenuIndex=0;drawGamesMenu();}
+      if(encPressed){
+        switch(gamesMenuIndex){
+          case 0:currentMode=MODE_GAME;snkInited=false;break;       // Snake
+          case 1:currentMode=MODE_TETRIS;tetInited=false;break;      // Tetris
+          case 2:currentMode=MODE_BREAKOUT;brkInited=false;break;    // Breakout
+          case 3:currentMode=MODE_FLAPPY;flpInited=false;break;      // Flappy Bird
+          case 4:currentMode=MODE_PONG;pngInited=false;break;        // Pong
+          case 5:currentMode=MODE_2048;g48Inited=false;break;        // 2048
+        }
+      }
+      if(k0Pressed){currentMode=MODE_MENU;drawMenu();}
+      break;
+
+    case MODE_CLOCK:{
+      struct tm ti;
+      if(getLocalTime(&ti)){if(ti.tm_sec!=prevSecond){prevSecond=ti.tm_sec;
+        drawClockTime(getTimeStr('H'),getTimeStr('M'),getTimeStr('S'));
+        if(ti.tm_sec%5==0){updateEnvSensors(true);drawEnvDynamic(curTemp,curHum,curTVOC,curECO2);}}}
+      if(k0Pressed){currentMode=MODE_MENU;drawMenu();}
+      break;}
+
+    case MODE_POMODORO:{
+      if(pomoState==POMO_SELECT){
+        if(encStep!=0){
+          if(pomoField==0){pomoMinutes=constrain((int)pomoMinutes+encStep,0,99);}
+          else{pomoSeconds=constrain((int)pomoSeconds+encStep,0,59);}
+          drawPomodoroScreen(false);
+        }
+        if(encPressed){
+          static unsigned long lastPress=0;
+          unsigned long now=millis();
+          if(now-lastPress<500 && (pomoMinutes>0||pomoSeconds>0)){
+            pomoState=POMO_RUNNING;
+            pomoStartMillis=millis();
+            prevPomoRemainSec=-1;
+            drawPomodoroScreen(true);
+          } else {
+            pomoField=(pomoField+1)%2;
+            drawPomodoroScreen(false);
+          }
+          lastPress=now;
+        }
+      }
+      else if(pomoState==POMO_RUNNING||pomoState==POMO_PAUSED){
+        unsigned long dMs=(pomoMinutes*60UL+pomoSeconds)*1000UL;
+        unsigned long elapsed=0;
+        if(pomoState==POMO_RUNNING)elapsed=millis()-pomoStartMillis;
+        else elapsed=pomoPausedMillis-pomoStartMillis;
+        if(elapsed>=dMs){
+          if(pomoState!=POMO_DONE){pomoState=POMO_DONE;startMelody(pomoDoneMelody,pomoDoneDurations,POMO_MELODY_LEN,false);drawPomodoroScreen(true);}
+        }
+        int rs=(dMs-elapsed)/1000UL;
+        if(rs!=prevPomoRemainSec){prevPomoRemainSec=rs;drawPomodoroScreen(false);}
+
+        if(encPressed){
+          if(pomoState==POMO_RUNNING){pomoState=POMO_PAUSED;pomoPausedMillis=millis();drawPomodoroScreen(true);}
+          else{pomoStartMillis+=(millis()-pomoPausedMillis);pomoState=POMO_RUNNING;prevPomoRemainSec=-1;drawPomodoroScreen(true);}
+        }
+      }
+      else if(pomoState==POMO_DONE){
+        if(encPressed){pomoState=POMO_SELECT;pomoField=0;drawPomodoroScreen(true);}
+      }
+      if(k0Pressed){currentMode=MODE_MENU;drawMenu();}
+      break;}
+
+    case MODE_ALARM:{
+      if(alarmRinging){
+        if(encPressed||k0Pressed){dismissAlert();drawAlarmScreen(true);}
+        break;}
+      bool ch=false;
+      if(encStep!=0){
+        if(alarmSelectedField==0){alarmHour=(alarmHour+(encStep>0?1:23))%24;ch=true;}
+        else if(alarmSelectedField==1){alarmMinute=(alarmMinute+(encStep>0?1:59))%60;ch=true;}
+        else{alarmEnabled=!alarmEnabled;ch=true;mqttClient.publish(TOPIC_ALARM_STATE,alarmEnabled?"ON":"OFF",true);}
+        if(ch)lastAlarmDayTriggered=-1;}
+      if(encPressed){alarmSelectedField=(alarmSelectedField+1)%3;ch=true;}
+      if(k0Pressed){currentMode=MODE_MENU;drawMenu();break;}
+      if(ch){drawAlarmScreen(false);drawAlarmIcon();}
+      break;}
+
+    case MODE_GAME:
+      if(!snkInited) initSnake();
+      updateSnake(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_TETRIS:
+      if(!tetInited) initTetris();
+      updateTetris(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_BREAKOUT:
+      if(!brkInited) initBreakout();
+      updateBreakout(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_FLAPPY:
+      if(!flpInited) initFlappy();
+      updateFlappy(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_PONG:
+      if(!pngInited) initPong();
+      updatePong(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_2048:
+      if(!g48Inited) init2048();
+      update2048(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_HOME:
+      if(!homeInited) initHome();
+      updateHome(encStep,encPressed,k0Pressed);
+      break;
+
+    case MODE_BRIGHT:
+      if(encStep!=0){
+        backlightLevel=constrain((int)backlightLevel+encStep*10,5,255);
+        analogWrite(BL_PIN,backlightLevel);
+        publishBacklightState();  // Backlight state
+        drawBrightnessScreen(false);
+      }
+      if(k0Pressed){
+        saveSettings();
+        currentMode=MODE_MENU;drawMenu();
+      }
+      break;
+
+    case MODE_SETTINGS:
+      if(encStep!=0){
+        switch(settingsField){
+          case 0: volumeLevel=constrain((int)volumeLevel+encStep*5,0,100);
+                  if(volumeLevel>0){ vTone(BUZZ_PIN,1000,50); }
+                  break;
+          case 1: tempOffset=constrain(tempOffset+encStep*0.5f,-15.0f,15.0f); break;
+          case 2: humOffset=constrain(humOffset+encStep*1.0f,-20.0f,20.0f); break;
+          case 3: sleepOptionIndex=constrain(sleepOptionIndex+encStep,0,SLEEP_OPTION_COUNT-1);
+                  sleepTimeoutMs=sleepOptions[sleepOptionIndex];
+                  resetActivityTimer();
+                  // Sync to HA
+                  if(mqttClient.connected()) mqttClient.publish(TOPIC_AUTOSLEEP_STATE, sleepTimeoutMs>0?"ON":"OFF", true);
+                  break;
+          case 4: selectedAlarm=constrain((int)selectedAlarm+encStep,0,ALARM_COUNT-1);
+                  playAlarmByIndex(selectedAlarm,false);
+                  break;
+        }
+        drawSettingsScreen(false);
+      }
+      if(encPressed){
+        settingsField=(settingsField+1)%SETTINGS_COUNT;
+        drawSettingsScreen(false);
+      }
+      if(k0Pressed){
+        vToneStop();
+        saveSettings();  // Save all settings to NVS
+        currentMode=MODE_MENU;
+        drawMenu();
+      }
+      break;
+  }
+}

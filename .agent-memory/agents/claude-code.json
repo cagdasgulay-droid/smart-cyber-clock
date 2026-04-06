@@ -1,0 +1,8 @@
+{
+  "name": "claude-code",
+  "type": "cli",
+  "launch_cmd": "claude",
+  "md_file": "",
+  "created": "2026-04-06T01:59:09.531895",
+  "settings": {}
+}

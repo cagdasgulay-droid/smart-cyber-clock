@@ -1,0 +1,6 @@
+# Ignore API keys and secrets
+*.secret
+*.key
+.env
+# Keep everything else tracked
+!.gitignore

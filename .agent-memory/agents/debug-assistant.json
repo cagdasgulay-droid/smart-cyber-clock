@@ -1,0 +1,8 @@
+{
+  "name": "debug-assistant",
+  "type": "md-agent",
+  "launch_cmd": "cat .agent-memory/agents/debug-assistant.md",
+  "md_file": ".agent-memory/agents/debug-assistant.md",
+  "created": "2026-04-06T02:23:28.038658",
+  "settings": {}
+}

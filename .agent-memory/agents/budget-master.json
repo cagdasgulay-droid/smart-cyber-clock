@@ -1,0 +1,8 @@
+{
+  "name": "budget-master",
+  "type": "md-agent",
+  "launch_cmd": "cat .agent-memory/agents/budget-master.md",
+  "md_file": ".agent-memory/agents/budget-master.md",
+  "created": "2026-04-06T02:23:28.016975",
+  "settings": {}
+}

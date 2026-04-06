@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "project_name": "CYBER CLOCK",
+  "default_agent": "claude-code",
+  "auto_save_sessions": true,
+  "max_session_history": 50,
+  "context_auto_load": true,
+  "agents": {}
+}

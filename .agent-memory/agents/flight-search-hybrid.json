@@ -1,0 +1,8 @@
+{
+  "name": "flight-search-hybrid",
+  "type": "md-agent",
+  "launch_cmd": "cat .agent-memory/agents/flight-search-hybrid.md",
+  "md_file": ".agent-memory/agents/flight-search-hybrid.md",
+  "created": "2026-04-06T02:23:28.099385",
+  "settings": {}
+}

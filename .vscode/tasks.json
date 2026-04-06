@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "🤖 Agent Hub: Status",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" status",
+      "problemMatcher": []
+    },
+    {
+      "label": "🔄 Agent Hub: Switch Agent",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/smart-switch.sh\"",
+      "problemMatcher": []
+    },
+    {
+      "label": "▶️ Agent Hub: Launch Claude Code",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" launch claude-code",
+      "problemMatcher": []
+    },
+    {
+      "label": "▶️ Agent Hub: Launch Copilot",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" launch copilot",
+      "problemMatcher": []
+    },
+    {
+      "label": "▶️ Agent Hub: Launch Cline",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" launch cline",
+      "problemMatcher": []
+    },
+    {
+      "label": "💾 Agent Hub: Save Session",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" save",
+      "problemMatcher": []
+    },
+    {
+      "label": "🕐 Agent Hub: History",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" history claude-code",
+      "problemMatcher": []
+    },
+    {
+      "label": "🧠 Agent Hub: Show Context",
+      "type": "shell",
+      "command": "\"${workspaceFolder}/.agent-memory/scripts/agent-hub.sh\" context",
+      "problemMatcher": []
+    }
+  ]
+}

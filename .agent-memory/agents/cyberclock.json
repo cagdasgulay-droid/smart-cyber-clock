@@ -1,0 +1,8 @@
+{
+  "name": "cyberclock",
+  "type": "md-agent",
+  "launch_cmd": "cat .agent-memory/agents/cyberclock-agent.md",
+  "md_file": ".agent-memory/agents/cyberclock-agent.md",
+  "created": "2026-04-06T02:02:31.608537",
+  "settings": {}
+}
